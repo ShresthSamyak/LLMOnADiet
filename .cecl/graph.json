@@ -1,0 +1,720 @@
+{
+  "nodes": [
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/__init__.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "line": 29,
+      "code": "def _configure_logging(verbose: bool) -> None:\n    level = logging.DEBUG if verbose else logging.INFO\n    logging.basicConfig(\n        format=\"%(levelname)s  %(message)s\",\n        level=level,\n        stream=sys.stderr,\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_py_files",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "line": 38,
+      "code": "def _collect_py_files(root: Path) -> list[Path]:\n    \"\"\"Walk root recursively, skipping ignored directories.\"\"\"\n    files: list[Path] = []\n    for path in root.rglob(\"*.py\"):\n        if any(part in IGNORE_DIRS for part in path.parts):\n            continue\n        files.append(path)\n    return sorted(files)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "line": 49,
+      "code": "def index(\n    directory: Path = typer.Argument(\n        default=Path(\".\"),\n        help=\"Root directory to scan (default: current directory).\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Scan Python files and build a call graph saved to .cecl/graph.json.\"\"\"\n    _configure_logging(verbose)\n    logger = logging.getLogger(__name__)\n\n    logger.info(\"Scanning %s for Python files\u2026\", directory)\n    py_files = _collect_py_files(directory)\n    if not py_files:\n        typer.echo(\"No Python files found.\", err=True)\n        raise typer.Exit(code=1)\n\n    logger.info(\"Found %d files \u2014 parsing\u2026\", len(py_files))\n\n    results = []\n    errors = 0\n    for path in py_files:\n        result = parse_file(path)\n        if result is None:\n            errors += 1\n        else:\n            results.append(result)\n\n    logger.info(\"Parsed %d files (%d skipped due to errors).\", len(results), errors)\n\n    graph = build_graph(results)\n\n    out_dir = directory / OUTPUT_DIR\n    out_dir.mkdir(parents=True, exist_ok=True)\n    out_path = out_dir / OUTPUT_FILE\n    out_path.write_text(json.dumps(graph, indent=2), encoding=\"utf-8\")\n\n    node_counts = Counter(n[\"type\"] for n in graph[\"nodes\"])\n    edge_counts = Counter(e[\"type\"] for e in graph[\"edges\"])\n    typer.echo(f\"Graph saved \u2192 {out_path}\")\n    typer.echo(\n        f\"  nodes : {len(graph['nodes'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(node_counts.items()))\n    )\n    typer.echo(\n        f\"  edges : {len(graph['edges'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(edge_counts.items()))\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "line": 104,
+      "code": "def query(\n    query_str: str = typer.Argument(..., metavar=\"QUERY\", help=\"Natural-language query, e.g. 'fix login bug'.\"),\n    graph_path: Path = typer.Option(\n        Path(\".cecl/graph.json\"),\n        \"--graph\", \"-g\",\n        help=\"Path to graph.json produced by `index`.\",\n    ),\n    raw: bool = typer.Option(False, \"--raw\", help=\"Print full JSON result instead of formatted output.\"),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Query the code graph and return minimal relevant context.\"\"\"\n    _configure_logging(verbose)\n\n    if not graph_path.exists():\n        typer.echo(f\"Graph not found at {graph_path}. Run `context-engine index` first.\", err=True)\n        raise typer.Exit(code=1)\n\n    try:\n        graph = json.loads(graph_path.read_text(encoding=\"utf-8\"))\n    except json.JSONDecodeError as exc:\n        typer.echo(f\"Failed to parse {graph_path}: {exc}\", err=True)\n        raise typer.Exit(code=1)\n\n    result = run_query(query_str, graph)\n\n    if raw:\n        typer.echo(json.dumps(result, indent=2))\n        return\n\n    # Human-readable output.\n    typer.echo(f\"intent        : {result['intent']}\")\n    typer.echo(f\"keywords      : {', '.join(result['keywords'])}\")\n    typer.echo(f\"entry points  : {len(result['entry_points'])}\")\n    for ep in result[\"entry_points\"]:\n        typer.echo(f\"  \u2022 {ep}\")\n    typer.echo(f\"nodes selected: {len(result['nodes_selected'])}\")\n    raw_tokens = result[\"token_estimate_raw\"]\n    compressed_tokens = result[\"token_estimate\"]\n    if raw_tokens > 0:\n        saved_pct = 100 * (raw_tokens - compressed_tokens) // raw_tokens\n    else:\n        saved_pct = 0\n    typer.echo(\n        f\"tokens        : ~{compressed_tokens} (raw ~{raw_tokens}, \u2212{saved_pct}%)\"\n    )\n    typer.echo(\"\")\n    typer.echo(\"\u2500\" * 72)\n    typer.echo(result[\"context\"])\n    typer.echo(\"\u2500\" * 72)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:main",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "line": 155,
+      "code": "def main() -> None:\n    app()"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_debug_log",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 20,
+      "code": "def _is_debug_log(stmt: ast.stmt) -> bool:\n    \"\"\"Return True if *stmt* is a bare print/logging call at statement level.\"\"\"\n    if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):\n        return False\n    func = stmt.value.func\n    if isinstance(func, ast.Name):\n        return func.id in _PRINT_NAMES\n    if isinstance(func, ast.Attribute):\n        return func.attr in _LOG_ATTRS\n    return False"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_docstring",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 32,
+      "code": "def _is_docstring(stmt: ast.stmt) -> bool:\n    \"\"\"Detect a bare string expression \u2014 typically a docstring.\"\"\"\n    return (\n        isinstance(stmt, ast.Expr)\n        and isinstance(stmt.value, ast.Constant)\n        and isinstance(stmt.value.value, str)\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_contains_keyword",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 41,
+      "code": "def _contains_keyword(node: ast.AST, keywords: set[str]) -> bool:\n    \"\"\"Check if any keyword appears as an identifier or string inside *node*.\"\"\"\n    if not keywords:\n        return False\n    for child in ast.walk(node):\n        if isinstance(child, ast.Name) and child.id.lower() in keywords:\n            return True\n        if isinstance(child, ast.Attribute) and child.attr.lower() in keywords:\n            return True\n        if isinstance(child, ast.Constant) and isinstance(child.value, str):\n            if any(kw in child.value.lower() for kw in keywords):\n                return True\n    return False"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_has_call",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 56,
+      "code": "def _has_call(node: ast.AST) -> bool:\n    \"\"\"Return True if *node*'s subtree contains any function call.\"\"\"\n    return any(isinstance(c, ast.Call) for c in ast.walk(node))"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_pure_constant_rhs",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 61,
+      "code": "def _is_pure_constant_rhs(node: ast.AST) -> bool:\n    \"\"\"True when RHS is a literal constant / tuple / list / dict of constants.\"\"\"\n    if isinstance(node, ast.Constant):\n        return True\n    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):\n        return all(isinstance(e, ast.Constant) for e in node.elts)\n    if isinstance(node, ast.Dict):\n        return all(\n            (k is None or isinstance(k, ast.Constant)) and isinstance(v, ast.Constant)\n            for k, v in zip(node.keys, node.values)\n        )\n    return False"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_should_keep",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 79,
+      "code": "def _should_keep(stmt: ast.stmt, keywords: set[str]) -> bool:\n    \"\"\"Decide whether a statement inside a function body survives compression.\"\"\"\n    # Drop prints / debug logs first.\n    if _is_debug_log(stmt):\n        return False\n\n    # Drop docstrings unless they mention a keyword.\n    if _is_docstring(stmt):\n        return _contains_keyword(stmt, keywords)\n\n    # Always keep control-flow, returns, raises, exit statements.\n    if isinstance(stmt, (\n        ast.Return, ast.Raise, ast.If, ast.Try, ast.For, ast.While,\n        ast.With, ast.AsyncFor, ast.AsyncWith, ast.Assert,\n        ast.Break, ast.Continue, ast.Pass,\n    )):\n        return True\n\n    # Nested function/class definitions: keep their shape.\n    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n        return True\n\n    # Imports inside a function body are deliberate \u2014 keep them.\n    if isinstance(stmt, (ast.Import, ast.ImportFrom)):\n        return True\n\n    # Assignments: drop pure-constant boilerplate without keyword signal.\n    if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign)):\n        rhs = getattr(stmt, \"value\", None)\n        if rhs is None:\n            return True\n        if _contains_keyword(stmt, keywords):\n            return True\n        if _has_call(rhs):\n            return True\n        if _is_pure_constant_rhs(rhs):\n            return False\n        return True  # complex expression \u2014 keep by default\n\n    # Expression statements: keep only if they carry a keyword.\n    if isinstance(stmt, ast.Expr):\n        return _contains_keyword(stmt, keywords)\n\n    return True"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_filter_body",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 125,
+      "code": "def _filter_body(body: list[ast.stmt], keywords: set[str]) -> list[ast.stmt]:\n    \"\"\"Return a filtered copy of *body* keeping only relevant statements.\"\"\"\n    result: list[ast.stmt] = []\n    for stmt in body:\n        if not _should_keep(stmt, keywords):\n            continue\n\n        # Recurse into control-flow bodies so we also prune their interiors.\n        if isinstance(stmt, ast.If):\n            stmt.body = _filter_body(stmt.body, keywords) or [ast.Pass()]\n            stmt.orelse = _filter_body(stmt.orelse, keywords)\n        elif isinstance(stmt, (ast.For, ast.While, ast.AsyncFor)):\n            stmt.body = _filter_body(stmt.body, keywords) or [ast.Pass()]\n            stmt.orelse = _filter_body(stmt.orelse, keywords)\n        elif isinstance(stmt, ast.Try):\n            stmt.body = _filter_body(stmt.body, keywords) or [ast.Pass()]\n            for handler in stmt.handlers:\n                handler.body = _filter_body(handler.body, keywords) or [ast.Pass()]\n            stmt.orelse = _filter_body(stmt.orelse, keywords)\n            stmt.finalbody = _filter_body(stmt.finalbody, keywords)\n        elif isinstance(stmt, (ast.With, ast.AsyncWith)):\n            stmt.body = _filter_body(stmt.body, keywords) or [ast.Pass()]\n\n        result.append(stmt)\n    return result"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_collect_callees",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 156,
+      "code": "def _collect_callees(tree: ast.AST) -> list[str]:\n    \"\"\"Return deduplicated callee names found in *tree*, in AST order.\"\"\"\n    names: list[str] = []\n    seen: set[str] = set()\n    for node in ast.walk(tree):\n        if not isinstance(node, ast.Call):\n            continue\n        func = node.func\n        name: str | None = None\n        if isinstance(func, ast.Name):\n            name = func.id\n        elif isinstance(func, ast.Attribute):\n            name = func.attr\n        if not name:\n            continue\n        if name in _PRINT_NAMES or name in _LOG_ATTRS:\n            continue\n        if name in seen:\n            continue\n        seen.add(name)\n        names.append(name)\n    return names"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:compress_code",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "line": 184,
+      "code": "def compress_code(snippet: str, keywords: Iterable[str]) -> str:\n    \"\"\"Compress a function/method snippet, keeping only debug-relevant lines.\n\n    Preserves:\n      * the ``def``/``async def`` signature\n      * return / raise / conditional / try-except statements\n      * statements that contain a query keyword or a function call\n\n    Drops:\n      * print and logging statements\n      * pure-constant assignments\n      * docstrings without keyword matches\n\n    Appends a ``# calls: a(), b()`` comment enumerating call dependencies.\n    If the snippet can't be parsed as a function, it's returned unchanged.\n    \"\"\"\n    if not snippet or not snippet.strip():\n        return snippet\n\n    kw_set = {k.lower() for k in keywords}\n    dedented = textwrap.dedent(snippet).strip()\n\n    try:\n        tree = ast.parse(dedented)\n    except SyntaxError:\n        return snippet\n\n    if not tree.body:\n        return snippet\n\n    top = tree.body[0]\n    if not isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):\n        return snippet\n\n    callees = _collect_callees(top)\n    top.body = _filter_body(top.body, kw_set) or [ast.Pass()]\n\n    try:\n        compressed = ast.unparse(top)\n    except Exception:\n        return snippet\n\n    if callees:\n        hint = \", \".join(f\"{name}()\" for name in callees)\n        compressed = f\"{compressed}\\n# calls: {hint}\"\n\n    return compressed"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_file_id",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "line": 19,
+      "code": "def _file_id(file_path: str) -> str:\n    \"\"\"Normalise a file path to a stable, forward-slash node ID.\"\"\"\n    return Path(file_path).as_posix()"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_symbol_id",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "line": 24,
+      "code": "def _symbol_id(file_path: str, symbol: str) -> str:\n    \"\"\"Return '<file>:<symbol>' \u2014 the canonical node ID for a symbol.\"\"\"\n    return f\"{_file_id(file_path)}:{symbol}\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "line": 33,
+      "code": "def build_graph(results: list[FileParseResult]) -> Graph:\n    \"\"\"Convert parsed file results into a node/edge graph.\n\n    Node types  : file, function, method, class\n    Edge types  : contains, has_method, calls, imports\n    \"\"\"\n    nodes: dict[str, Node] = {}\n    edges: list[Edge] = []\n    seen_edges: set[tuple[str, str, str]] = set()\n\n    # ------------------------------------------------------------------\n    # Helpers\n    # ------------------------------------------------------------------\n\n    def add_node(node: Node) -> None:\n        nid = node[\"id\"]\n        if nid not in nodes:\n            nodes[nid] = node\n        else:\n            logger.debug(\"Duplicate node skipped: %s\", nid)\n\n    def add_edge(src: str, dst: str, edge_type: str) -> None:\n        key = (src, dst, edge_type)\n        if key not in seen_edges:\n            seen_edges.add(key)\n            edges.append({\"from\": src, \"to\": dst, \"type\": edge_type})\n\n    # ------------------------------------------------------------------\n    # Pass 1 \u2014 register every node; build lookup tables for edge resolution.\n    # ------------------------------------------------------------------\n\n    # Maps symbol_id \u2192 set of file-relative names defined in that file.\n    # Used in pass 2 to decide whether a call edge is resolvable.\n    file_local_names: dict[str, set[str]] = {}   # file_id \u2192 {symbol_name, ...}\n\n    for result in results:\n        fid = _file_id(result.path)\n        local: set[str] = set()\n        file_local_names[fid] = local\n\n        # File node\n        add_node({\"id\": fid, \"type\": \"file\"})\n\n        # Function nodes\n        for func in result.functions:\n            sid = _symbol_id(result.path, func.name)\n            add_node({\n                \"id\": sid,\n                \"type\": \"function\",\n                \"file\": fid,\n                \"line\": func.line,\n                \"code\": func.code,\n            })\n            local.add(func.name)\n\n        # Class + method nodes\n        for cls in result.classes:\n            cid = _symbol_id(result.path, cls.name)\n            add_node({\n                \"id\": cid,\n                \"type\": \"class\",\n                \"file\": fid,\n                \"line\": cls.line,\n            })\n            local.add(cls.name)\n\n            for method in cls.methods:\n                qualified = f\"{cls.name}.{method.name}\"\n                mid = _symbol_id(result.path, qualified)\n                add_node({\n                    \"id\": mid,\n                    \"type\": \"method\",\n                    \"file\": fid,\n                    \"line\": method.line,\n                    \"code\": method.code,\n                })\n                local.add(method.name)   # bare name for call resolution\n\n    # ------------------------------------------------------------------\n    # Pass 2 \u2014 emit edges.\n    # ------------------------------------------------------------------\n\n    # Build a reverse map: bare symbol name \u2192 list of node IDs that define it.\n    # Lets us resolve cross-file calls when there is an explicit import.\n    name_to_ids: dict[str, list[str]] = {}\n    for node in nodes.values():\n        if node[\"type\"] in (\"function\", \"method\", \"class\"):\n            bare = node[\"id\"].split(\":\")[-1].split(\".\")[-1]\n            name_to_ids.setdefault(bare, []).append(node[\"id\"])\n\n    for result in results:\n        fid = _file_id(result.path)\n        local_names = file_local_names[fid]\n\n        # contains: file \u2192 function / class\n        for func in result.functions:\n            add_edge(fid, _symbol_id(result.path, func.name), \"contains\")\n\n        for cls in result.classes:\n            cid = _symbol_id(result.path, cls.name)\n            add_edge(fid, cid, \"contains\")\n\n            # has_method: class \u2192 method\n            for method in cls.methods:\n                qualified = f\"{cls.name}.{method.name}\"\n                add_edge(cid, _symbol_id(result.path, qualified), \"has_method\")\n\n        # imports: file \u2192 file  (resolve module name to a known file node)\n        for imp in result.imports:\n            # Try each candidate module path spelling.\n            for candidate in _module_candidates(imp.module):\n                if candidate in nodes:\n                    add_edge(fid, candidate, \"imports\")\n                    break\n\n        # calls \u2014 only emit if callee is local OR explicitly imported.\n        resolvable = local_names | result.imported_names\n\n        for func in result.functions:\n            caller_id = _symbol_id(result.path, func.name)\n            for callee_name in func.calls:\n                _maybe_add_call(\n                    caller_id, callee_name, resolvable, fid,\n                    result.path, local_names, name_to_ids, add_edge,\n                )\n\n        for cls in result.classes:\n            for method in cls.methods:\n                caller_id = _symbol_id(result.path, f\"{cls.name}.{method.name}\")\n                for callee_name in method.calls:\n                    _maybe_add_call(\n                        caller_id, callee_name, resolvable, fid,\n                        result.path, local_names, name_to_ids, add_edge,\n                    )\n\n    logger.info(\"Graph built: %d nodes, %d edges\", len(nodes), len(edges))\n    return {\"nodes\": list(nodes.values()), \"edges\": edges}"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_module_candidates",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "line": 176,
+      "code": "def _module_candidates(module: str) -> list[str]:\n    \"\"\"Generate plausible file-node IDs for a dotted module name.\"\"\"\n    parts = module.strip().split(\".\")\n    candidates = []\n    # e.g. \"auth.utils\" \u2192 [\"auth/utils.py\", \"auth/utils/__init__.py\"]\n    base = \"/\".join(parts)\n    candidates.append(f\"{base}.py\")\n    candidates.append(f\"{base}/__init__.py\")\n    # Also try top-level module as a single file.\n    if len(parts) > 1:\n        candidates.append(f\"{parts[-1]}.py\")\n    return candidates"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_maybe_add_call",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "line": 190,
+      "code": "def _maybe_add_call(\n    caller_id: str,\n    callee_name: str,\n    resolvable: set[str],\n    caller_file_id: str,\n    caller_path: str,\n    local_names: set[str],\n    name_to_ids: dict[str, list[str]],\n    add_edge_fn: Any,\n) -> None:\n    \"\"\"Emit a calls edge only when the callee is verifiably resolvable.\"\"\"\n    if callee_name not in resolvable:\n        return\n\n    if callee_name in local_names:\n        # Prefer same-file symbol by building the qualified ID.\n        callee_id = _symbol_id(caller_path, callee_name)\n        # Might be a bare method name like \"save\" \u2014 also check \"ClassName.save\".\n        if callee_id in _name_to_ids_local(caller_file_id, callee_name, name_to_ids):\n            add_edge_fn(caller_id, callee_id, \"calls\")\n            return\n        # Fall back to any node in this file sharing the bare name.\n        for nid in name_to_ids.get(callee_name, []):\n            if nid.startswith(caller_file_id + \":\"):\n                add_edge_fn(caller_id, nid, \"calls\")\n                return\n    else:\n        # Imported name \u2014 resolve to whichever node carries that bare name.\n        candidates = name_to_ids.get(callee_name, [])\n        for nid in candidates:\n            add_edge_fn(caller_id, nid, \"calls\")"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_name_to_ids_local",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "line": 223,
+      "code": "def _name_to_ids_local(file_id: str, name: str, name_to_ids: dict[str, list[str]]) -> list[str]:\n    return [nid for nid in name_to_ids.get(name, []) if nid.startswith(file_id + \":\")]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_get_snippet",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 60,
+      "code": "def _get_snippet(source: str, node: ast.AST) -> str:\n    \"\"\"Return the exact source segment for *node*, with line-slice fallback.\"\"\"\n    snippet = ast.get_source_segment(source, node)\n    if snippet:\n        return snippet\n    # Fallback: slice by line numbers when get_source_segment fails.\n    lines = source.splitlines()\n    start = node.lineno - 1  # type: ignore[attr-defined]\n    end = getattr(node, \"end_lineno\", node.lineno)  # type: ignore[attr-defined]\n    return \"\\n\".join(lines[start:end])"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_extract_calls",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 72,
+      "code": "def _extract_calls(node: ast.AST) -> list[str]:\n    \"\"\"Return deduplicated bare callee names found in *node*'s subtree.\"\"\"\n    calls: list[str] = []\n    for child in ast.walk(node):\n        if not isinstance(child, ast.Call):\n            continue\n        func = child.func\n        if isinstance(func, ast.Name):\n            calls.append(func.id)\n        elif isinstance(func, ast.Attribute):\n            calls.append(func.attr)\n    return list(dict.fromkeys(calls))"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_parse_import_stmt",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 86,
+      "code": "def _parse_import_stmt(node: ast.Import | ast.ImportFrom) -> ImportInfo:\n    if isinstance(node, ast.Import):\n        # `import a, b` \u2192 one ImportInfo per alias keeps things uniform\n        return ImportInfo(\n            module=\", \".join(alias.name for alias in node.names),\n            names=[],\n        )\n    module = node.module or \"\"\n    names = [alias.name for alias in node.names]\n    return ImportInfo(module=module, names=names)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_collect_imported_names",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 98,
+      "code": "def _collect_imported_names(imports: list[ImportInfo]) -> set[str]:\n    \"\"\"Build the flat set of names that are brought into scope by imports.\"\"\"\n    names: set[str] = set()\n    for imp in imports:\n        if imp.names:\n            # `from x import a, b` \u2192 {a, b}\n            names.update(imp.names)\n        else:\n            # `import a.b.c` \u2192 top-level name is a\n            top = imp.module.split(\",\")[0].strip().split(\".\")[0]\n            if top:\n                names.add(top)\n    return names"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_top_level_functions",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 117,
+      "code": "def _top_level_functions(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:\n    \"\"\"Return only module-level functions (not methods inside classes).\"\"\"\n    result = []\n    for node in ast.iter_child_nodes(tree):\n        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):\n            result.append(node)\n    return result"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 130,
+      "code": "def parse_file(path: Path) -> FileParseResult | None:\n    \"\"\"Parse a single .py file and return structured metadata.\"\"\"\n    rel = str(path)\n    try:\n        source = path.read_text(encoding=\"utf-8\", errors=\"replace\")\n        tree = ast.parse(source, filename=rel)\n    except SyntaxError as exc:\n        logger.warning(\"Syntax error in %s: %s\", rel, exc)\n        return None\n    except Exception as exc:\n        logger.warning(\"Cannot parse %s: %s\", rel, exc)\n        return None\n\n    result = FileParseResult(path=rel, source=source)\n\n    # Collect imports first so we can resolve names later.\n    for node in ast.walk(tree):\n        if isinstance(node, (ast.Import, ast.ImportFrom)):\n            result.imports.append(_parse_import_stmt(node))\n\n    result.imported_names = _collect_imported_names(result.imports)\n\n    # Classes \u2014 iterate top-level nodes to preserve class scope.\n    for node in ast.iter_child_nodes(tree):\n        if isinstance(node, ast.ClassDef):\n            methods: list[MethodInfo] = []\n            for item in node.body:\n                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):\n                    methods.append(\n                        MethodInfo(\n                            name=item.name,\n                            class_name=node.name,\n                            file=rel,\n                            line=item.lineno,\n                            code=_get_snippet(source, item),\n                            calls=_extract_calls(item),\n                        )\n                    )\n            result.classes.append(\n                ClassInfo(name=node.name, file=rel, line=node.lineno, methods=methods)\n            )\n\n    # Module-level functions only (skip methods already captured above).\n    for node in _top_level_functions(tree):\n        result.functions.append(\n            FunctionInfo(\n                name=node.name,\n                file=rel,\n                line=node.lineno,\n                code=_get_snippet(source, node),\n                calls=_extract_calls(node),\n            )\n        )\n\n    return result"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:FunctionInfo",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 12
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:MethodInfo",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 21
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:ClassInfo",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 31
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:ImportInfo",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 39
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:FileParseResult",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "line": 46
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:parse_query",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 53,
+      "code": "def parse_query(query: str) -> dict[str, Any]:\n    \"\"\"Return intent + keywords extracted from a raw query string.\n\n    Intent is ``\"debug\"`` when the query contains a debugging trigger word,\n    otherwise ``\"lookup\"``.  Keywords are lower-cased non-stop words that are\n    likely symbol names (letters/digits/underscores only).\n    \"\"\"\n    tokens = re.findall(r\"[a-zA-Z_][a-zA-Z0-9_]*\", query.lower())\n    intent = \"debug\" if _DEBUG_TRIGGERS & set(tokens) else \"lookup\"\n    keywords = [t for t in tokens if t not in _STOP_WORDS and t not in _DEBUG_TRIGGERS]\n    # Deduplicate preserving order.\n    seen: set[str] = set()\n    unique_kw: list[str] = []\n    for kw in keywords:\n        if kw not in seen:\n            seen.add(kw)\n            unique_kw.append(kw)\n    return {\"intent\": intent, \"keywords\": unique_kw}"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:find_entry_points",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 77,
+      "code": "def find_entry_points(keywords: list[str], nodes: list[Node]) -> list[str]:\n    \"\"\"Return node IDs whose name or file path contains any keyword.\"\"\"\n    entries: list[str] = []\n    for node in nodes:\n        if node[\"type\"] not in (\"function\", \"method\", \"class\", \"file\"):\n            continue\n        nid: str = node[\"id\"]\n        # The part after the last ':' is the bare symbol; before it is the file.\n        label = nid.split(\":\")[-1].lower()\n        file_part = nid.split(\":\")[0].lower()\n        for kw in keywords:\n            if kw in label or kw in file_part:\n                entries.append(nid)\n                break\n    return entries"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:_build_adjacency",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 98,
+      "code": "def _build_adjacency(edges: list[Edge]) -> tuple[dict[str, list[tuple[str, str]]], dict[str, list[tuple[str, str]]]]:\n    \"\"\"Build forward and reverse adjacency maps from the edge list.\n\n    Returns ``(outgoing, incoming)`` where each value is a list of\n    ``(neighbour_id, edge_type)`` tuples.\n    \"\"\"\n    outgoing: dict[str, list[tuple[str, str]]] = {}\n    incoming: dict[str, list[tuple[str, str]]] = {}\n    for edge in edges:\n        src, dst, etype = edge[\"from\"], edge[\"to\"], edge[\"type\"]\n        outgoing.setdefault(src, []).append((dst, etype))\n        incoming.setdefault(dst, []).append((src, etype))\n    return outgoing, incoming"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:traverse_graph",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 113,
+      "code": "def traverse_graph(\n    entry_ids: list[str],\n    nodes: list[Node],\n    edges: list[Edge],\n    max_depth: int = _MAX_DEPTH,\n) -> dict[str, int]:\n    \"\"\"BFS from each entry node following calls, imports, and reverse-calls.\n\n    Returns a mapping of ``node_id \u2192 minimum depth`` reached.  Depth 0 means\n    the node is an entry point; depth 1 means one hop away, etc.\n    \"\"\"\n    node_ids: set[str] = {n[\"id\"] for n in nodes}\n    outgoing, incoming = _build_adjacency(edges)\n\n    # Edge types to follow in each direction.\n    _follow_out: frozenset[str] = frozenset({\"calls\", \"imports\", \"contains\", \"has_method\"})\n    _follow_in: frozenset[str] = frozenset({\"calls\"})   # reverse-calls for debugging\n\n    visited: dict[str, int] = {}\n    queue: deque[tuple[str, int]] = deque()\n\n    for eid in entry_ids:\n        if eid in node_ids:\n            queue.append((eid, 0))\n            visited[eid] = 0\n\n    while queue:\n        current, depth = queue.popleft()\n        if depth >= max_depth:\n            continue\n\n        # Forward edges\n        for neighbour, etype in outgoing.get(current, []):\n            if etype in _follow_out and neighbour not in visited:\n                visited[neighbour] = depth + 1\n                queue.append((neighbour, depth + 1))\n\n        # Reverse call edges (who calls *current*)\n        for neighbour, etype in incoming.get(current, []):\n            if etype in _follow_in and neighbour not in visited:\n                visited[neighbour] = depth + 1\n                queue.append((neighbour, depth + 1))\n\n    return visited"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:rank_nodes",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 163,
+      "code": "def rank_nodes(\n    visited: dict[str, int],\n    entry_ids: list[str],\n    all_nodes: list[Node],\n    max_nodes: int = _MAX_NODES,\n) -> list[Node]:\n    \"\"\"Return up to *max_nodes* nodes ordered by relevance.\n\n    Priority (lower score = higher priority):\n      0 \u2014 entry node\n      1 \u2014 depth-1 function/method (direct callee/caller)\n      2 \u2014 depth-1 file/class\n      3 \u2014 depth-2 function/method\n      4 \u2014 depth-2 file/class\n    \"\"\"\n    entry_set = set(entry_ids)\n    node_map: dict[str, Node] = {n[\"id\"]: n for n in all_nodes}\n\n    def _priority(node_id: str) -> int:\n        if node_id in entry_set:\n            return 0\n        depth = visited.get(node_id, 99)\n        ntype = node_map.get(node_id, {}).get(\"type\", \"\")\n        is_code = ntype in (\"function\", \"method\")\n        if depth == 1:\n            return 1 if is_code else 2\n        if depth == 2:\n            return 3 if is_code else 4\n        return 10\n\n    ranked_ids = sorted(visited.keys(), key=_priority)\n    result: list[Node] = []\n    for nid in ranked_ids:\n        node = node_map.get(nid)\n        if node is not None:\n            result.append(node)\n        if len(result) >= max_nodes:\n            break\n    return result"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:build_context",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 208,
+      "code": "def build_context(\n    ranked_nodes: list[Node],\n    entry_ids: list[str],\n    keywords: list[str] | None = None,\n    compress: bool = True,\n) -> str:\n    \"\"\"Assemble deduplicated code snippets ordered by entry \u2192 callees \u2192 callers.\n\n    Each function/method snippet is passed through :func:`compress_code` so\n    the emitted context contains only debug-relevant lines plus a\n    ``# calls:`` dependency hint.  File/class nodes without code contribute a\n    comment stub.\n    \"\"\"\n    entry_set = set(entry_ids)\n    kws = keywords or []\n\n    # Split into ordered buckets.\n    entries: list[Node] = []\n    rest: list[Node] = []\n    for node in ranked_nodes:\n        (entries if node[\"id\"] in entry_set else rest).append(node)\n\n    ordered = entries + rest\n    seen_ids: set[str] = set()\n    parts: list[str] = []\n\n    for node in ordered:\n        nid = node[\"id\"]\n        if nid in seen_ids:\n            continue\n        seen_ids.add(nid)\n\n        code: str = node.get(\"code\", \"\").strip()\n        ntype: str = node.get(\"type\", \"\")\n\n        if code:\n            if compress and ntype in (\"function\", \"method\"):\n                code = compress_code(code, kws).strip()\n            if not code:\n                continue\n            header = f\"# [{ntype}] {nid}\"\n            parts.append(f\"{header}\\n{code}\")\n        else:\n            # file / class nodes without snippets: emit a comment stub.\n            parts.append(f\"# [{ntype}] {nid}\")\n\n    return \"\\n\\n\".join(parts)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:estimate_tokens",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 261,
+      "code": "def estimate_tokens(text: str) -> int:\n    \"\"\"Rough token count: characters / 4 (GPT-style approximation).\"\"\"\n    return max(1, len(text) // 4)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 270,
+      "code": "def run_query(query: str, graph: Graph, compress: bool = True) -> QueryResult:\n    \"\"\"Full retrieval pipeline: query string + graph \u2192 QueryResult.\n\n    When *compress* is True (default), every function/method snippet is\n    passed through :func:`compress_code` to shrink the emitted context.\n    ``token_estimate_raw`` reports what the context would cost without\n    compression, enabling a savings comparison.\n    \"\"\"\n    parsed = parse_query(query)\n    intent: str = parsed[\"intent\"]\n    keywords: list[str] = parsed[\"keywords\"]\n\n    nodes: list[Node] = graph[\"nodes\"]\n    edges: list[Edge] = graph[\"edges\"]\n\n    entry_ids = find_entry_points(keywords, nodes)\n    visited = traverse_graph(entry_ids, nodes, edges)\n    ranked = rank_nodes(visited, entry_ids, nodes)\n\n    context_text = build_context(ranked, entry_ids, keywords, compress=compress)\n    raw_text = build_context(ranked, entry_ids, keywords, compress=False)\n\n    return QueryResult(\n        intent=intent,\n        keywords=keywords,\n        entry_points=entry_ids,\n        nodes_selected=[n[\"id\"] for n in ranked],\n        token_estimate=estimate_tokens(context_text),\n        token_estimate_raw=estimate_tokens(raw_text),\n        context=context_text,\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:Graph",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 19
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:QueryResult",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "line": 24
+    }
+  ],
+  "edges": [
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_py_files",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:main",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_py_files",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_debug_log",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_docstring",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_contains_keyword",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_has_call",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_pure_constant_rhs",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_should_keep",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_filter_body",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_collect_callees",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:compress_code",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_should_keep",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_debug_log",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_should_keep",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_docstring",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_should_keep",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_contains_keyword",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_should_keep",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_has_call",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_should_keep",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_is_pure_constant_rhs",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_filter_body",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_should_keep",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_filter_body",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_filter_body",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:compress_code",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_collect_callees",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:compress_code",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:_filter_body",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_file_id",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_symbol_id",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_module_candidates",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_maybe_add_call",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_name_to_ids_local",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_symbol_id",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_file_id",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_file_id",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_symbol_id",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_module_candidates",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_maybe_add_call",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_maybe_add_call",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_symbol_id",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_maybe_add_call",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:_name_to_ids_local",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_get_snippet",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_extract_calls",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_parse_import_stmt",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_collect_imported_names",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_top_level_functions",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:FunctionInfo",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:MethodInfo",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:ClassInfo",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:ImportInfo",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:FileParseResult",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_parse_import_stmt",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:ImportInfo",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:FileParseResult",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_collect_imported_names",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_top_level_functions",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:FunctionInfo",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_parse_import_stmt",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:ClassInfo",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_get_snippet",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_extract_calls",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:MethodInfo",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:parse_query",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:find_entry_points",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:_build_adjacency",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:traverse_graph",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:rank_nodes",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:build_context",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:estimate_tokens",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:Graph",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:QueryResult",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:traverse_graph",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:_build_adjacency",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:build_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py:compress_code",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:parse_query",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:find_entry_points",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:traverse_graph",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:rank_nodes",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:build_context",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:QueryResult",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:estimate_tokens",
+      "type": "calls"
+    }
+  ]
+}
