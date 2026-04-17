@@ -7,6 +7,7 @@ from collections import deque
 from typing import Any, TypedDict
 
 from .compressor import compress_code
+from .pruner import PruneResult, importance_score, prune
 
 # ---------------------------------------------------------------------------
 # Types
@@ -26,6 +27,8 @@ class QueryResult(TypedDict):
     keywords: list[str]
     entry_points: list[str]
     nodes_selected: list[str]
+    categories: dict[str, str]
+    inline_hints: dict[str, list[str]]
     token_estimate: int
     token_estimate_raw: int
     context: str
@@ -166,14 +169,12 @@ def rank_nodes(
     all_nodes: list[Node],
     max_nodes: int = _MAX_NODES,
 ) -> list[Node]:
-    """Return up to *max_nodes* nodes ordered by relevance.
+    """Return up to *max_nodes* candidate nodes ordered by relevance.
 
-    Priority (lower score = higher priority):
-      0 — entry node
-      1 — depth-1 function/method (direct callee/caller)
-      2 — depth-1 file/class
-      3 — depth-2 function/method
-      4 — depth-2 file/class
+    Primary key — structural priority (entry < direct code < direct struct
+    < indirect code < indirect struct).  Secondary key — negative importance
+    score, so within a tier the higher-signal nodes surface first.  The
+    pruner then narrows the candidates further.
     """
     entry_set = set(entry_ids)
     node_map: dict[str, Node] = {n["id"]: n for n in all_nodes}
@@ -190,7 +191,11 @@ def rank_nodes(
             return 3 if is_code else 4
         return 10
 
-    ranked_ids = sorted(visited.keys(), key=_priority)
+    def _sort_key(node_id: str) -> tuple[int, int]:
+        node = node_map.get(node_id, {})
+        return (_priority(node_id), -importance_score(node))
+
+    ranked_ids = sorted(visited.keys(), key=_sort_key)
     result: list[Node] = []
     for nid in ranked_ids:
         node = node_map.get(nid)
@@ -210,16 +215,19 @@ def build_context(
     entry_ids: list[str],
     keywords: list[str] | None = None,
     compress: bool = True,
+    inline_hints: dict[str, list[str]] | None = None,
 ) -> str:
-    """Assemble deduplicated code snippets ordered by entry → callees → callers.
+    """Assemble code snippets ordered by entry → callees → callers.
 
     Each function/method snippet is passed through :func:`compress_code` so
     the emitted context contains only debug-relevant lines plus a
-    ``# calls:`` dependency hint.  File/class nodes without code contribute a
-    comment stub.
+    ``# calls:`` dependency hint.  When *inline_hints* is provided, each
+    entry-node block gets its helper hints appended (one per line).  File
+    and class nodes without code contribute a comment stub only.
     """
     entry_set = set(entry_ids)
     kws = keywords or []
+    hints = inline_hints or {}
 
     # Split into ordered buckets.
     entries: list[Node] = []
@@ -246,9 +254,11 @@ def build_context(
             if not code:
                 continue
             header = f"# [{ntype}] {nid}"
-            parts.append(f"{header}\n{code}")
+            block = f"{header}\n{code}"
+            if nid in hints:
+                block += "\n" + "\n".join(hints[nid])
+            parts.append(block)
         else:
-            # file / class nodes without snippets: emit a comment stub.
             parts.append(f"# [{ntype}] {nid}")
 
     return "\n\n".join(parts)
@@ -270,10 +280,10 @@ def estimate_tokens(text: str) -> int:
 def run_query(query: str, graph: Graph, compress: bool = True) -> QueryResult:
     """Full retrieval pipeline: query string + graph → QueryResult.
 
-    When *compress* is True (default), every function/method snippet is
-    passed through :func:`compress_code` to shrink the emitted context.
-    ``token_estimate_raw`` reports what the context would cost without
-    compression, enabling a savings comparison.
+    Pipeline: parse → entry-points → BFS traversal → rank (wide funnel) →
+    **prune** (classify, dedup, inline) → compress → assemble.
+    ``token_estimate_raw`` measures the pre-compression pre-prune baseline,
+    so the CLI can report an end-to-end savings ratio.
     """
     parsed = parse_query(query)
     intent: str = parsed["intent"]
@@ -286,14 +296,26 @@ def run_query(query: str, graph: Graph, compress: bool = True) -> QueryResult:
     visited = traverse_graph(entry_ids, nodes, edges)
     ranked = rank_nodes(visited, entry_ids, nodes)
 
-    context_text = build_context(ranked, entry_ids, keywords, compress=compress)
+    # Narrow candidates into a minimal, categorised set.
+    result: PruneResult = prune(ranked, entry_ids, visited)
+
+    context_text = build_context(
+        result.kept,
+        entry_ids,
+        keywords,
+        compress=compress,
+        inline_hints=result.inline_hints,
+    )
+    # Baseline: untouched candidates, no compression, no inlining.
     raw_text = build_context(ranked, entry_ids, keywords, compress=False)
 
     return QueryResult(
         intent=intent,
         keywords=keywords,
         entry_points=entry_ids,
-        nodes_selected=[n["id"] for n in ranked],
+        nodes_selected=[n["id"] for n in result.kept],
+        categories=dict(result.categories),
+        inline_hints=dict(result.inline_hints),
         token_estimate=estimate_tokens(context_text),
         token_estimate_raw=estimate_tokens(raw_text),
         context=context_text,

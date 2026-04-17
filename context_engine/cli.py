@@ -136,7 +136,17 @@ def query(
     typer.echo(f"entry points  : {len(result['entry_points'])}")
     for ep in result["entry_points"]:
         typer.echo(f"  • {ep}")
-    typer.echo(f"nodes selected: {len(result['nodes_selected'])}")
+    cats = result["categories"]
+    from collections import Counter as _C
+    cat_counts = _C(cats.values())
+    typer.echo(
+        f"nodes kept    : {len(result['nodes_selected'])}  "
+        + "  ".join(f"{k}={v}" for k, v in sorted(cat_counts.items()))
+    )
+    inline_count = sum(len(v) for v in result["inline_hints"].values())
+    if inline_count:
+        typer.echo(f"inline hints  : {inline_count}")
+
     raw_tokens = result["token_estimate_raw"]
     compressed_tokens = result["token_estimate"]
     if raw_tokens > 0:
