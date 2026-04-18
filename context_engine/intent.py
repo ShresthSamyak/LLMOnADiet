@@ -616,16 +616,21 @@ def generate_code_snippet(
 def _file_to_module(fpath: str) -> str:
     """Convert an absolute file path to a dotted Python import path.
 
-    Finds the first path segment that looks like a Python package name
-    (all lowercase, no spaces, no special characters) and uses everything
-    from that segment onward.
+    Anchoring priority:
+    1. If "app" is a path segment, anchor there (FastAPI/Django project convention).
+    2. Otherwise find the first all-lowercase Python package name segment.
 
     Example: ``C:/Users/HP/project/app/core/security.py`` → ``app.core.security``
+    Example: ``C:/Users/HP/project/context_engine/cli.py`` → ``context_engine.cli``
     """
     normalized = fpath.replace("\\", "/")
     parts = normalized.split("/")
     if parts:
         parts[-1] = re.sub(r"\.pyi?$", "", parts[-1])
+    # Prefer "app" as anchor — avoids long system-path prefixes
+    if "app" in parts:
+        idx = parts.index("app")
+        return ".".join(p for p in parts[idx:] if p)
     for i, part in enumerate(parts):
         if re.match(r"^[a-z][a-z0-9_]*$", part):
             return ".".join(p for p in parts[i:] if p)
@@ -758,6 +763,159 @@ def generate_imports(
 
 
 # ---------------------------------------------------------------------------
+# 6c. Missing implementations + debug fix generation
+# ---------------------------------------------------------------------------
+
+# Minimal working implementations for commonly missing auth dependencies.
+# Each entry: fn_name → (sync_impl, async_impl)
+_MISSING_IMPL_TEMPLATES: dict[str, tuple[str, str]] = {
+    "get_user_by_email": (
+        "def get_user_by_email(db: Session, email: str):\n"
+        "    return db.query(User).filter(User.email == email).first()",
+        "async def get_user_by_email(db: AsyncSession, email: str):\n"
+        "    result = await db.execute(select(User).where(User.email == email))\n"
+        "    return result.scalar_one_or_none()",
+    ),
+    "verify_password": (
+        "def verify_password(plain_password: str, hashed_password: str) -> bool:\n"
+        '    return pwd_context.verify(plain_password, hashed_password)',
+        "def verify_password(plain_password: str, hashed_password: str) -> bool:\n"
+        '    return pwd_context.verify(plain_password, hashed_password)',
+    ),
+    "create_access_token": (
+        "def create_access_token(subject: str) -> str:\n"
+        "    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)\n"
+        '    payload = {"sub": subject, "exp": expire}\n'
+        "    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)",
+        "def create_access_token(subject: str) -> str:\n"
+        "    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)\n"
+        '    payload = {"sub": subject, "exp": expire}\n'
+        "    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)",
+    ),
+    "get_db": (
+        "def get_db():\n"
+        "    db = SessionLocal()\n"
+        "    try:\n"
+        "        yield db\n"
+        "    finally:\n"
+        "        db.close()",
+        "async def get_db() -> AsyncGenerator[AsyncSession, None]:\n"
+        "    async with AsyncSessionLocal() as session:\n"
+        "        yield session",
+    ),
+}
+
+
+def generate_missing_impl(missing_deps: list[str], is_async: bool) -> str:
+    """Return concatenated minimal implementations for each missing dependency."""
+    impls: list[str] = []
+    for dep in missing_deps:
+        fn_name = dep.split("(")[0].strip()
+        if fn_name in _MISSING_IMPL_TEMPLATES:
+            sync_impl, async_impl = _MISSING_IMPL_TEMPLATES[fn_name]
+            impls.append(async_impl if is_async else sync_impl)
+    return "\n\n".join(impls)
+
+
+# Debug fix rules: (trigger_words, check, root_cause, fix_code)
+_DEBUG_FIX_RULES: list[tuple[frozenset[str], str, str, str]] = [
+    (
+        frozenset({"jwt", "token", "bearer", "secret", "key", "exp", "expir", "claim"}),
+        "Token expiry and SECRET_KEY consistency across services",
+        "Token expired, or signed/verified with mismatched SECRET_KEY",
+        'ALGORITHM = "HS256"\nACCESS_TOKEN_EXPIRE_MINUTES = 30\n\n'
+        '# Inspect a live token:\npayload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])\n'
+        'if payload["exp"] < datetime.utcnow().timestamp():\n'
+        '    raise HTTPException(status_code=401, detail="Token expired")',
+    ),
+    (
+        frozenset({"password", "hash", "bcrypt", "argon", "pbkdf", "verify", "credential"}),
+        "Password hash algorithm and context config on both hash + verify sides",
+        "Password hashed with different settings or algorithm than verification",
+        'from passlib.context import CryptContext\n\n'
+        'pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")\n\n'
+        'def verify_password(plain: str, hashed: str) -> bool:\n'
+        '    return pwd_context.verify(plain, hashed)',
+    ),
+    (
+        frozenset({"cors", "origin", "allow", "preflight"}),
+        "CORSMiddleware present in app startup; allow_origins covers frontend URL",
+        "CORS policy blocking pre-flight or credential requests from the frontend",
+        'from fastapi.middleware.cors import CORSMiddleware\n\n'
+        'app.add_middleware(\n'
+        '    CORSMiddleware,\n'
+        '    allow_origins=["http://localhost:3000"],\n'
+        '    allow_credentials=True,\n'
+        '    allow_methods=["*"],\n'
+        '    allow_headers=["*"],\n'
+        ')',
+    ),
+    (
+        frozenset({"db", "database", "session", "connect", "pool", "sql", "sqlite"}),
+        "DB connection pool size, session lifecycle, and async session factory config",
+        "Session not committed, not closed, or connection pool limit reached",
+        "async with AsyncSessionLocal() as db:\n"
+        "    async with db.begin():\n"
+        "        result = await db.execute(\n"
+        "            select(User).where(User.email == email)\n"
+        "        )\n"
+        "    # session commits + closes automatically on context exit",
+    ),
+    (
+        frozenset({"permission", "role", "forbidden", "403", "scope", "access", "guard"}),
+        "User role populated on login and permission check logic correct",
+        "Permission denied — role not assigned, or check condition is inverted",
+        'user = await get_user_by_email(db, email)\n'
+        'print(f"roles: {user.roles}")\n'
+        'if "admin" not in user.roles:\n'
+        '    raise HTTPException(status_code=403, detail="Forbidden")',
+    ),
+]
+
+
+def generate_debug_fix(
+    failures: list[dict[str, str]],
+    keywords: list[str],
+) -> tuple[list[str], list[str], str]:
+    """Return (checks, root_causes, fix_code) for debug output.
+
+    Matches the combined keyword+failure signal against ``_DEBUG_FIX_RULES``.
+    Falls back to a generic trace snippet when no rule fires.
+    """
+    signal: set[str] = set(keywords)
+    for f in failures:
+        signal.update(f["detail"].lower().split())
+
+    for trigger_set, check, root_cause, fix in _DEBUG_FIX_RULES:
+        if trigger_set & signal:
+            return [check], [root_cause], fix
+
+    # Fallback: generate a minimal trace wrapper around the first failure site.
+    if failures:
+        f = failures[0]
+        if f["kind"] == "raises":
+            fix = (
+                f"try:\n    result = {f['node']}(...)\n"
+                f"except Exception as e:\n    print(f'Error in {f['node']}: {{e}}')\n    raise"
+            )
+        elif f["kind"] == "catches":
+            fix = (
+                f"import logging\nlogger = logging.getLogger(__name__)\n\n"
+                f"try:\n    ...\nexcept {f['detail']} as e:\n"
+                f"    logger.exception('Unexpected error in {f['node']}')\n    raise"
+            )
+        else:
+            fix = f"assert <condition>, '<condition> must hold before calling {f['node']}()'"
+        return (
+            [f"Inspect failure site: {f['node']}"],
+            [f"{f['node']} {f['kind']}: {f['detail']}"],
+            fix,
+        )
+
+    return [], [], ""
+
+
+# ---------------------------------------------------------------------------
 # 7. Output formatters
 # ---------------------------------------------------------------------------
 
@@ -793,8 +951,7 @@ def _format_debug(
             lines.append(f"  {_bare(ep)}")
         lines.append("")
 
-    # Annotated failure path: every function in call order, annotated with what
-    # can go wrong.  Functions with no failures show "OK".
+    # Annotated failure path
     if flow:
         failure_map: dict[str, list[str]] = {}
         for f in failures:
@@ -809,18 +966,26 @@ def _format_debug(
         lines.append("FAILURE PATH:")
         for fn in flow:
             notes = failure_map.get(fn, [])
-            if notes:
-                lines.append(f"  {fn}  ->  {', '.join(notes)}")
-            else:
-                lines.append(f"  {fn}  ->  OK")
+            suffix = "  ->  " + ", ".join(notes) if notes else "  ->  OK"
+            lines.append(f"  {fn}{suffix}")
         lines.append("")
 
-    hints = debug_hints(failures, result.get("keywords", []))
-    if hints:
-        lines.append("LIKELY ISSUES:")
-        for h in hints:
-            lines.append(f"  - {h}")
+    checks, root_causes, fix_code = generate_debug_fix(failures, result.get("keywords", []))
+
+    if checks:
+        lines.append("CHECK:")
+        for c in checks:
+            lines.append(f"  - {c}")
         lines.append("")
+
+    if root_causes:
+        lines.append("ROOT CAUSE (LIKELY):")
+        for rc in root_causes:
+            lines.append(f"  - {rc}")
+        lines.append("")
+
+    if fix_code:
+        lines += ["FIX:", _DIVIDER, fix_code, _DIVIDER, ""]
 
     nodes_sel = result.get("nodes_selected", [])
     lines += [
@@ -925,10 +1090,26 @@ def _format_generate(
     lines += ["GENERATED CODE:", _DIVIDER, snippet, _DIVIDER, ""]
 
     if missing:
-        lines.append("MISSING:")
-        for dep in missing:
-            lines.append(f"  - {dep}")
-        lines.append("")
+        missing_code = generate_missing_impl(missing, is_async)
+        if missing_code:
+            lines += ["MISSING IMPLEMENTATION:", _DIVIDER, missing_code, _DIVIDER, ""]
+        else:
+            # No template available — fall back to listing
+            lines.append("MISSING (implement before deploying):")
+            for dep in missing:
+                lines.append(f"  - {dep}")
+            lines.append("")
+
+    # Integration guidance
+    action_verb = "Add to" if target["action"] == "add" else "Create"
+    insert_lines = [
+        "INSERTION HINT:",
+        f"  1. {action_verb}: {target['file']}",
+    ]
+    if framework == "fastapi":
+        insert_lines.append("  2. Register in main app:  app.include_router(router, prefix='/auth')")
+    insert_lines.append("")
+    lines.extend(insert_lines)
 
     if result.get("context"):
         lines += ["EXISTING CODE:", _DIVIDER, result["context"], _DIVIDER]
