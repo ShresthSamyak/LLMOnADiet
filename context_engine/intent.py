@@ -447,16 +447,22 @@ def _gen_auth_snippet(
     aw = "await " if is_async else ""
     if framework == "fastapi":
         return (
+            f'router = APIRouter()\n'
+            f'\n'
+            f'\n'
             f'@router.post("/login")\n'
-            f'{a}def login(email: str, password: str, db: AsyncSession = Depends({db_fn})):\n'
-            f'    user = {aw}{user_fn}(db, email)\n'
-            f'    if not user or not {verify_fn}(password, user.hashed_password):\n'
+            f'{a}def login(data: LoginRequest, db: AsyncSession = Depends({db_fn})):\n'
+            f'    user = {aw}{user_fn}(db, data.email)\n'
+            f'    if not user or not {verify_fn}(data.password, user.hashed_password):\n'
             f'        raise HTTPException(status_code=401, detail="Invalid credentials")\n'
             f'    token = {token_fn}(subject=str(user.id))\n'
             f'    return {{"access_token": token, "token_type": "bearer"}}'
         )
     if framework == "flask":
         return (
+            f'auth_bp = Blueprint("auth", __name__)\n'
+            f'\n'
+            f'\n'
             f'@auth_bp.post("/login")\n'
             f'def login():\n'
             f'    data = request.get_json()\n'
@@ -485,6 +491,9 @@ def _gen_user_snippet(
     aw = "await " if is_async else ""
     if framework == "fastapi":
         return (
+            f'router = APIRouter()\n'
+            f'\n'
+            f'\n'
             f'@router.post("/users", status_code=201)\n'
             f'{a}def create_user(data: CreateUserRequest, db: AsyncSession = Depends({db_fn})):\n'
             f'    if {aw}{user_fn}(db, data.email):\n'
@@ -656,24 +665,63 @@ def find_integration_target(
     return {"action": "create", "file": "app/api/routes/new.py"}
 
 
+def generate_schema(keywords: list[str], framework: str) -> str:
+    """Return a Pydantic BaseModel class definition for the request body.
+
+    Only emitted for FastAPI (the only framework where Pydantic request models
+    are idiomatic).  Returns an empty string for all other frameworks.
+    """
+    if framework != "fastapi":
+        return ""
+    kw = set(keywords)
+    if kw & {"login", "auth", "authenticate", "signin"}:
+        return (
+            "class LoginRequest(BaseModel):\n"
+            "    email: str\n"
+            "    password: str"
+        )
+    if kw & {"user", "register", "signup", "account"}:
+        return (
+            "class CreateUserRequest(BaseModel):\n"
+            "    email: str\n"
+            "    password: str\n"
+            "    username: str | None = None"
+        )
+    return ""
+
+
+# Known third-party package prefixes — used to separate framework imports from local ones.
+_THIRD_PARTY_PREFIXES: frozenset[str] = frozenset({
+    "fastapi", "pydantic", "sqlalchemy", "starlette", "uvicorn",
+    "flask", "django", "aiohttp", "httpx", "requests",
+    "celery", "redis", "boto3", "jose", "passlib", "bcrypt",
+})
+
+
 def generate_imports(
     framework: str,
     is_async: bool,
     fn_names: list[str],
     all_nodes: list[Node],
+    has_schema: bool = False,
 ) -> list[str]:
-    """Generate import statements for the code snippet.
+    """Generate properly grouped import statements.
 
-    Emits framework-level imports first, then groups found functions by their
-    source file into ``from <module> import <fn1>, <fn2>`` lines.
+    Group 1 — third-party (fastapi, pydantic, sqlalchemy, …), alphabetical.
+    Group 2 — local project imports (one ``from <module> import …`` per file).
+    Groups separated by a blank line.
     """
-    lines: list[str] = []
-
+    third_party: list[str] = []
     if framework == "fastapi":
-        lines.append("from fastapi import APIRouter, Depends, HTTPException")
+        third_party.append("from fastapi import APIRouter, Depends, HTTPException")
+        if has_schema:
+            third_party.append("from pydantic import BaseModel")
         if is_async:
-            lines.append("from sqlalchemy.ext.asyncio import AsyncSession")
-        lines.append("")
+            third_party.append("from sqlalchemy.ext.asyncio import AsyncSession")
+    elif framework == "flask":
+        third_party.append("from flask import Blueprint, abort, jsonify, request")
+    elif has_schema:
+        third_party.append("from pydantic import BaseModel")
 
     # Build fn_name → source_file map from graph
     file_map: dict[str, str] = {}
@@ -686,16 +734,26 @@ def generate_imports(
             if fpath:
                 file_map[name] = fpath
 
-    # Group by module, emit one from-import per module
+    # Group by module path, emit one from-import per module
     module_fns: dict[str, list[str]] = {}
     for name, fpath in file_map.items():
         module = _file_to_module(fpath)
         module_fns.setdefault(module, []).append(name)
 
+    local: list[str] = []
     for module in sorted(module_fns):
+        # Skip any module that resolves to a known third-party package
+        pkg = module.split(".")[0]
+        if pkg in _THIRD_PARTY_PREFIXES:
+            continue
         fns = ", ".join(sorted(module_fns[module]))
-        lines.append(f"from {module} import {fns}")
+        local.append(f"from {module} import {fns}")
 
+    lines: list[str] = []
+    lines.extend(third_party)
+    if third_party and local:
+        lines.append("")
+    lines.extend(local)
     return lines
 
 
@@ -820,29 +878,29 @@ def _format_generate(
     is_async = _detect_async(all_nodes)
     groups = group_components(kept_nodes)
     target = find_integration_target(all_nodes, kws)
+    schema = generate_schema(kws, framework)
     snippet, missing = generate_code_snippet(kws, kept_nodes, all_nodes, framework, is_async)
 
-    # Collect function names the snippet references, verified against graph nodes.
-    _fn_names_in_snippet: list[str] = []
-    for node in all_nodes:
-        if node.get("type") not in ("function", "method"):
-            continue
-        _, _, name = node["id"].rpartition(":")
-        if name in snippet:
-            _fn_names_in_snippet.append(name)
-
-    import_lines = generate_imports(framework, is_async, _fn_names_in_snippet, all_nodes)
+    # Collect graph-verified function names referenced in the snippet for imports.
+    fn_names_in_snippet: list[str] = [
+        node["id"].rpartition(":")[2]
+        for node in all_nodes
+        if node.get("type") in ("function", "method")
+        and node["id"].rpartition(":")[2] in snippet
+    ]
+    import_lines = generate_imports(framework, is_async, fn_names_in_snippet, all_nodes, has_schema=bool(schema))
 
     concurrency = "async" if is_async else "sync"
     lines: list[str] = [
-        "intent        : GENERATE",
-        f"keywords      : {', '.join(kws)}",
+        "INTENT:",
+        "GENERATE",
+        "",
         f"framework     : {framework}  ({concurrency})",
         "",
     ]
 
     if groups:
-        lines.append("DETECTED STACK:")
+        lines.append("AUTH STACK:" if kws and set(kws) & {"login", "auth", "authenticate", "signin", "token", "jwt"} else "DETECTED STACK:")
         for layer, fns in groups.items():
             lines.append(f"  {layer}:")
             for fn in fns:
@@ -861,10 +919,13 @@ def _format_generate(
         lines.extend(import_lines)
         lines += [_DIVIDER, ""]
 
+    if schema:
+        lines += ["SCHEMA:", _DIVIDER, schema, _DIVIDER, ""]
+
     lines += ["GENERATED CODE:", _DIVIDER, snippet, _DIVIDER, ""]
 
     if missing:
-        lines.append("MISSING (not found in graph — write these first):")
+        lines.append("MISSING:")
         for dep in missing:
             lines.append(f"  - {dep}")
         lines.append("")
