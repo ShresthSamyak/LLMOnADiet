@@ -548,22 +548,31 @@ def _gen_generic_snippet(name: str, framework: str, is_async: bool) -> str:
 
 def generate_code_snippet(
     keywords: list[str],
-    nodes: list[Node],
+    kept_nodes: list[Node],
+    all_nodes: list[Node],
     framework: str,
     is_async: bool,
 ) -> tuple[str, list[str]]:
     """Generate code grounded in actual graph nodes; return (snippet, missing_deps).
 
-    ``missing_deps`` lists function names that were referenced in the snippet
-    but could not be found in the graph — the caller surfaces these explicitly
-    so the user knows what still needs to be written.
+    Uses ``all_nodes`` (full graph) for existence checks so that functions which
+    exist in the graph but weren't in the pruned result set are NOT flagged as
+    missing.  Uses ``kept_nodes`` (query result) first to pick the most contextually
+    relevant function name, falling back to a search across ``all_nodes``.
     """
     kw = set(keywords)
 
-    verify_fn, verify_found = _find_fn(nodes, "verify_password", "verify", "check_password", "validate_password")
-    token_fn, token_found = _find_fn(nodes, "create_access_token", "create_access", "generate_token", "create_token", "sign_token")
-    user_fn, user_found = _find_fn(nodes, "get_user_by_email", "get_user", "find_user", "fetch_user", "lookup_user")
-    db_fn, db_found = _find_fn(nodes, "get_db", "get_db", "get_session", "db_session", "get_connection")
+    def _find_best(fallback: str, *signals: str) -> tuple[str, bool]:
+        """Find in kept first, then all_nodes; check existence against all_nodes."""
+        name, found = _find_fn(kept_nodes, fallback, *signals)
+        if not found:
+            name, found = _find_fn(all_nodes, fallback, *signals)
+        return name, found
+
+    verify_fn, verify_found = _find_best("verify_password", "verify", "check_password", "validate_password")
+    token_fn, token_found = _find_best("create_access_token", "create_access", "generate_token", "create_token", "sign_token")
+    user_fn, user_found = _find_best("get_user_by_email", "get_user", "find_user", "fetch_user", "lookup_user")
+    db_fn, db_found = _find_best("get_db", "get_db", "get_session", "db_session", "get_connection")
 
     missing: list[str] = []
 
@@ -589,6 +598,105 @@ def generate_code_snippet(
         return _gen_db_snippet(is_async), missing
 
     return _gen_generic_snippet(keywords[0] if keywords else "feature", framework, is_async), missing
+
+
+# ---------------------------------------------------------------------------
+# 6b. Integration target + import generation
+# ---------------------------------------------------------------------------
+
+def _file_to_module(fpath: str) -> str:
+    """Convert an absolute file path to a dotted Python import path.
+
+    Finds the first path segment that looks like a Python package name
+    (all lowercase, no spaces, no special characters) and uses everything
+    from that segment onward.
+
+    Example: ``C:/Users/HP/project/app/core/security.py`` → ``app.core.security``
+    """
+    normalized = fpath.replace("\\", "/")
+    parts = normalized.split("/")
+    if parts:
+        parts[-1] = re.sub(r"\.pyi?$", "", parts[-1])
+    for i, part in enumerate(parts):
+        if re.match(r"^[a-z][a-z0-9_]*$", part):
+            return ".".join(p for p in parts[i:] if p)
+    return ".".join(p for p in parts if p)
+
+
+def find_integration_target(
+    all_nodes: list[Node],
+    keywords: list[str],
+) -> dict[str, str]:
+    """Return the best existing file to add generated code to, or suggest a new one.
+
+    Returns ``{"action": "add"|"create", "file": "<path>"}``.
+    """
+    router_files: list[str] = []
+    for node in all_nodes:
+        if node.get("type") != "file":
+            continue
+        fpath = node["id"]
+        stem = re.split(r"[/\\]", fpath)[-1]
+        stem = re.sub(r"\.(py|js|ts)$", "", stem, flags=re.IGNORECASE).lower()
+        if any(tok in stem for tok in _ROUTER_TOKENS):
+            router_files.append(fpath)
+
+    kw = set(keywords)
+    if router_files:
+        for f in router_files:
+            f_lower = f.lower()
+            if kw & {"login", "auth", "signin"} and any(t in f_lower for t in ("auth", "login", "security")):
+                return {"action": "add", "file": _short_path(f)}
+        return {"action": "add", "file": _short_path(router_files[0])}
+
+    if kw & {"login", "auth", "authenticate", "signin"}:
+        return {"action": "create", "file": "app/api/routes/auth.py"}
+    if kw & {"user", "account", "profile", "register"}:
+        return {"action": "create", "file": "app/api/routes/users.py"}
+    return {"action": "create", "file": "app/api/routes/new.py"}
+
+
+def generate_imports(
+    framework: str,
+    is_async: bool,
+    fn_names: list[str],
+    all_nodes: list[Node],
+) -> list[str]:
+    """Generate import statements for the code snippet.
+
+    Emits framework-level imports first, then groups found functions by their
+    source file into ``from <module> import <fn1>, <fn2>`` lines.
+    """
+    lines: list[str] = []
+
+    if framework == "fastapi":
+        lines.append("from fastapi import APIRouter, Depends, HTTPException")
+        if is_async:
+            lines.append("from sqlalchemy.ext.asyncio import AsyncSession")
+        lines.append("")
+
+    # Build fn_name → source_file map from graph
+    file_map: dict[str, str] = {}
+    for node in all_nodes:
+        if node.get("type") not in ("function", "method"):
+            continue
+        _, _, name = node["id"].rpartition(":")
+        if name in fn_names and name not in file_map:
+            fpath = node.get("file", "")
+            if fpath:
+                file_map[name] = fpath
+
+    # Group by module, emit one from-import per module
+    module_fns: dict[str, list[str]] = {}
+    for name, fpath in file_map.items():
+        module = _file_to_module(fpath)
+        module_fns.setdefault(module, []).append(name)
+
+    for module in sorted(module_fns):
+        fns = ", ".join(sorted(module_fns[module]))
+        lines.append(f"from {module} import {fns}")
+
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -627,23 +735,31 @@ def _format_debug(
             lines.append(f"  {_bare(ep)}")
         lines.append("")
 
+    # Annotated failure path: every function in call order, annotated with what
+    # can go wrong.  Functions with no failures show "OK".
     if flow:
-        lines += ["CALL FLOW:", "  " + " -> ".join(flow), ""]
-
-    if failures:
-        lines.append("POTENTIAL FAILURES:")
+        failure_map: dict[str, list[str]] = {}
         for f in failures:
             if f["kind"] == "raises":
-                lines.append(f"  - {f['node']} raises {f['detail']}")
+                note = f"raises {f['detail']}"
             elif f["kind"] == "catches":
-                lines.append(f"  - {f['node']} catches {f['detail']}")
-            elif f["kind"] == "check":
-                lines.append(f"  - {f['node']}: guard on `{f['detail']}`")
+                note = f"catches {f['detail']}"
+            else:
+                note = f"guards on `{f['detail']}`"
+            failure_map.setdefault(f["node"], []).append(note)
+
+        lines.append("FAILURE PATH:")
+        for fn in flow:
+            notes = failure_map.get(fn, [])
+            if notes:
+                lines.append(f"  {fn}  ->  {', '.join(notes)}")
+            else:
+                lines.append(f"  {fn}  ->  OK")
         lines.append("")
 
     hints = debug_hints(failures, result.get("keywords", []))
     if hints:
-        lines.append("DEBUG HINTS:")
+        lines.append("LIKELY ISSUES:")
         for h in hints:
             lines.append(f"  - {h}")
         lines.append("")
@@ -700,13 +816,22 @@ def _format_generate(
     all_nodes: list[Node],
 ) -> str:
     kws = result.get("keywords", [])
-    # Use all_nodes for framework/async detection — kept_nodes may be empty
-    # (e.g. a generate query on a codebase with no matching auth code).
     framework = _detect_framework(all_nodes)
     is_async = _detect_async(all_nodes)
     groups = group_components(kept_nodes)
-    integration_points = find_integration_points(kept_nodes)
-    snippet, missing = generate_code_snippet(kws, kept_nodes, framework, is_async)
+    target = find_integration_target(all_nodes, kws)
+    snippet, missing = generate_code_snippet(kws, kept_nodes, all_nodes, framework, is_async)
+
+    # Collect function names the snippet references, verified against graph nodes.
+    _fn_names_in_snippet: list[str] = []
+    for node in all_nodes:
+        if node.get("type") not in ("function", "method"):
+            continue
+        _, _, name = node["id"].rpartition(":")
+        if name in snippet:
+            _fn_names_in_snippet.append(name)
+
+    import_lines = generate_imports(framework, is_async, _fn_names_in_snippet, all_nodes)
 
     concurrency = "async" if is_async else "sync"
     lines: list[str] = [
@@ -724,16 +849,22 @@ def _format_generate(
                 lines.append(f"    - {fn}()")
         lines.append("")
 
-    if integration_points:
-        lines.append("INTEGRATION POINT:")
-        for ip in integration_points:
-            lines.append(f"  Add in: {_short_path(ip)}")
-        lines.append("")
+    action_verb = "Add to" if target["action"] == "add" else "Create"
+    lines += [
+        "INTEGRATION TARGET:",
+        f"  {action_verb}: {target['file']}",
+        "",
+    ]
+
+    if import_lines:
+        lines += ["IMPORTS:", _DIVIDER]
+        lines.extend(import_lines)
+        lines += [_DIVIDER, ""]
 
     lines += ["GENERATED CODE:", _DIVIDER, snippet, _DIVIDER, ""]
 
     if missing:
-        lines.append("MISSING (not found in graph — implement these first):")
+        lines.append("MISSING (not found in graph — write these first):")
         for dep in missing:
             lines.append(f"  - {dep}")
         lines.append("")
