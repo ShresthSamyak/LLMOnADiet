@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .patcher import _extract_create_content, apply_file_diff, backup_file, generate_diff, parse_diff
 from .planner import plan
-from .ranker import format_output, rank_nodes
+from .ranker import format_output, rank_and_select
 from .retrieval import run_query
 from .validator import validate_no_duplicates, validate_patch
 
@@ -68,11 +68,13 @@ Return only code. No explanation.
 
 
 def _deterministic_context(query: str, result: dict) -> str:
-    """Rank and format nodes using the deterministic ranker (no LLM)."""
     nodes: list[dict] = result.get("nodes", [])
     if not nodes:
         return ""
-    return format_output(query, nodes)
+    ranked = rank_and_select(nodes, query)
+    if not ranked:
+        return ""
+    return format_output(query, ranked)
 
 
 def compress_context(query: str, result: dict) -> str:
