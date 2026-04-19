@@ -5,83 +5,95 @@ import re
 
 _STOPWORDS = frozenset({"a", "an", "the", "in", "to", "for", "of", "on", "at", "by", "is", "it"})
 
+_ALIASES: dict[str, set[str]] = {
+    "login": {"auth", "token", "password", "signin", "authenticate"},
+    "auth": {"login", "token", "jwt", "authenticate", "signin"},
+    "token": {"auth", "jwt", "access", "bearer", "refresh"},
+    "user": {"account", "profile", "member"},
+    "create": {"add", "insert", "post", "new"},
+    "delete": {"remove", "drop", "destroy"},
+    "get": {"fetch", "read", "retrieve", "find"},
+    "update": {"patch", "edit", "modify"},
+    "validate": {"check", "verify", "assert"},
+    "hash": {"password", "bcrypt", "crypt"},
+    "db": {"database", "session", "repo", "repository"},
+}
+
+
+def resolve_nodes(selected_ids: list[str], graph: dict) -> list[dict]:
+    """
+    Convert nodes_selected string IDs to enriched node dicts with
+    name, calls, and callers fields populated from the graph.
+    """
+    by_id: dict[str, dict] = {n["id"]: dict(n) for n in graph.get("nodes", []) if "id" in n}
+
+    calls_map: dict[str, list[str]] = {}
+    callers_map: dict[str, list[str]] = {}
+    for edge in graph.get("edges", []):
+        if edge.get("type") == "calls":
+            src, dst = edge["from"], edge["to"]
+            calls_map.setdefault(src, []).append(dst.split(":")[-1])
+            callers_map.setdefault(dst, []).append(src.split(":")[-1])
+
+    result = []
+    for nid in selected_ids:
+        node = by_id.get(nid)
+        if not node:
+            continue
+        node["name"] = nid.split(":")[-1]
+        node["calls"] = calls_map.get(nid, [])
+        node["callers"] = callers_map.get(nid, [])
+        result.append(node)
+    return result
+
 
 def _tokens(text: str) -> set[str]:
     return set(re.split(r"[_\W]+", text.lower())) - _STOPWORDS - {""}
 
 
+def _alias_tokens(query_tokens: set[str]) -> set[str]:
+    expanded = set(query_tokens)
+    for t in query_tokens:
+        expanded |= _ALIASES.get(t, set())
+    return expanded
+
+
 def _short_path(fpath: str) -> str:
     parts = fpath.replace("\\", "/").split("/")
-    return "/".join(parts[-2:]) if len(parts) >= 2 else fpath
+    return parts[-1] if parts else fpath
 
 
-def _score(node: dict, query_tokens: set[str], peer_files: set[str]) -> int:
+def _score(node: dict, query_tokens: set[str], alias_tokens: set[str]) -> int:
+    if node.get("type") not in ("function", "method"):
+        return 0
     name = node.get("name", "")
+    fpath = node.get("file", "").lower()
     name_tokens = _tokens(name)
+
     score = 0
     if name.lower() in query_tokens or name_tokens == query_tokens:
         score += 3
     score += len(query_tokens & name_tokens) * 2
-    if node.get("file") in peer_files:
-        score += 1
+    score += len((alias_tokens - query_tokens) & name_tokens)
+    if any(k in fpath for k in query_tokens):
+        score += 2
     return score
 
 
-def _select_top(nodes: list[dict], query_tokens: set[str], n: int = 5) -> list[dict]:
-    peer_files: set[str] = set()
-    scored = []
-    for node in nodes:
-        s = _score(node, query_tokens, peer_files)
-        if s > 0:
-            scored.append((s, node))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = [node for _, node in scored[:n]]
-    return top
+def _strip_comments(code: str) -> str:
+    lines = []
+    for line in code.splitlines():
+        cleaned = re.sub(r'\s*#.*$', "", line).rstrip()
+        if cleaned.strip():
+            lines.append(cleaned)
+    return "\n".join(lines)
 
 
-def _expand_one_hop(
-    top: list[dict],
-    all_nodes: list[dict],
-    query_tokens: set[str],
-    max_callers: int = 2,
-) -> list[dict]:
-    top_names = {n.get("name") for n in top}
-    by_name = {n.get("name"): n for n in all_nodes if n.get("name")}
-
-    additions: list[dict] = []
-    caller_count = 0
-
-    for node in top:
-        for callee in node.get("calls", []):
-            if callee and callee not in top_names and callee in by_name:
-                additions.append(by_name[callee])
-                top_names.add(callee)
-        for caller in node.get("callers", []):
-            if caller_count >= max_callers:
-                break
-            if caller and caller not in top_names and caller in by_name:
-                additions.append(by_name[caller])
-                top_names.add(caller)
-                caller_count += 1
-
-    combined = top + additions
-    peer_files = {n.get("file") for n in top}
-
-    re_scored = sorted(
-        combined,
-        key=lambda n: _score(n, query_tokens, peer_files),  # type: ignore[arg-type]
-        reverse=True,
-    )
-    return re_scored[:5]
-
-
-def _strip_code(code: str) -> str:
+def _strip_docstrings(code: str) -> str:
     try:
         tree = ast.parse(code)
     except SyntaxError:
-        return _strip_comments_regex(code)
-
-    # Remove docstrings
+        return code
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
             if (
@@ -91,36 +103,68 @@ def _strip_code(code: str) -> str:
                 and isinstance(node.body[0].value.value, str)
             ):
                 node.body.pop(0)
-
-    lines = code.splitlines()
-    out = _strip_comments_regex("\n".join(lines))
-    return out
+    return code
 
 
-def _strip_comments_regex(code: str) -> str:
-    lines = []
-    for line in code.splitlines():
-        stripped = line.rstrip()
-        # Remove inline and full-line comments but keep string content
-        cleaned = re.sub(r'\s*#[^"\']*$', "", stripped)
-        if cleaned.strip():
-            lines.append(cleaned)
+def _compress(code: str, max_lines: int = 18) -> str:
+    code = _strip_docstrings(code)
+    code = _strip_comments(code)
+    lines = [l for l in code.splitlines() if l.strip()]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["    ..."]
     return "\n".join(lines)
 
 
-def _truncate_body(code: str, max_lines: int = 20) -> str:
-    lines = code.splitlines()
-    if len(lines) <= max_lines:
-        return code
-    return "\n".join(lines[:max_lines]) + "\n    ..."
-
-
-def rank_and_select(all_nodes: list[dict], query: str) -> list[dict]:
+def rank_and_select(nodes: list[dict], query: str, top_n: int = 3) -> list[dict]:
     query_tokens = _tokens(query)
-    top = _select_top(all_nodes, query_tokens)
+    alias_tokens = _alias_tokens(query_tokens)
+
+    scored = []
+    for node in nodes:
+        s = _score(node, query_tokens, alias_tokens)
+        if s == 0:
+            continue
+        scored.append((s, node))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [n for _, n in scored[:top_n]]
+
     if not top:
         return []
-    return _expand_one_hop(top, all_nodes, query_tokens)
+
+    top_names = {n.get("name") for n in top}
+    by_name = {n.get("name"): n for n in nodes if n.get("name")}
+    additions: list[dict] = []
+    caller_count = 0
+
+    for node in top:
+        for callee in node.get("calls", []):
+            if callee and callee not in top_names and callee in by_name:
+                if _score(by_name[callee], query_tokens, alias_tokens) >= 2:
+                    additions.append(by_name[callee])
+                    top_names.add(callee)
+        for caller in node.get("callers", []):
+            if caller_count >= 2:
+                break
+            if caller and caller not in top_names and caller in by_name:
+                if _score(by_name[caller], query_tokens, alias_tokens) >= 2:
+                    additions.append(by_name[caller])
+                    top_names.add(caller)
+                    caller_count += 1
+
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for n in top + additions:
+        name = n.get("name")
+        if name and name not in seen:
+            seen.add(name)
+            unique.append(n)
+
+    re_scored = sorted(
+        unique,
+        key=lambda n: _score(n, query_tokens, alias_tokens),
+        reverse=True,
+    )
+    return re_scored[:top_n]
 
 
 def format_output(_query: str, nodes: list[dict]) -> str:
@@ -129,33 +173,24 @@ def format_output(_query: str, nodes: list[dict]) -> str:
 
     by_file: dict[str, list[dict]] = {}
     for node in nodes:
-        f = _short_path(node.get("file", "unknown"))
-        by_file.setdefault(f, []).append(node)
+        key = _short_path(node.get("file", "unknown"))
+        by_file.setdefault(key, []).append(node)
 
-    entry_lines = [f"* {n.get('name')} ({_short_path(n.get('file', ''))})" for n in nodes]
+    blocks: list[str] = []
+    total = 0
 
-    code_blocks: list[str] = []
-    total_lines = 0
-
-    for fpath, fnodes in by_file.items():
-        code_blocks.append(f"[{fpath}]")
+    for fname, fnodes in by_file.items():
+        blocks.append(f"[{fname}]")
         for node in fnodes:
-            raw = node.get("code", "")
-            stripped = _strip_code(raw)
-            truncated = _truncate_body(stripped)
-            block_lines = truncated.splitlines()
-            if total_lines + len(block_lines) > 90:
-                remaining = 90 - total_lines
+            compressed = _compress(node.get("code", ""))
+            lines = compressed.splitlines()
+            if total + len(lines) > 55:
+                remaining = 55 - total
                 if remaining <= 0:
                     break
-                block_lines = block_lines[:remaining] + ["    ..."]
-            code_blocks.extend(block_lines)
-            code_blocks.append("")
-            total_lines += len(block_lines) + 1
+                lines = lines[:remaining] + ["    ..."]
+            blocks.extend(lines)
+            blocks.append("")
+            total += len(lines) + 1
 
-    return (
-        "### Entry Points\n"
-        + "\n".join(entry_lines)
-        + "\n\n### Relevant Code\n"
-        + "\n".join(code_blocks).rstrip()
-    )
+    return "\n".join(l for l in blocks if l.strip()).strip()

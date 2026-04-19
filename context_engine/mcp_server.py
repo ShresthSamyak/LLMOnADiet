@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import sys
 import json
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 from mcp.server.fastmcp import FastMCP
 
-from .ranker import format_output, rank_and_select
-from .retrieval import run_query
+from context_engine.ranker import format_output, rank_and_select, resolve_nodes
+from context_engine.retrieval import run_query
 
 mcp = FastMCP("context-engine")
 
@@ -32,10 +35,12 @@ def get_context(query: str) -> str:
         return "ERROR: INDEX_NOT_FOUND"
 
     result = run_query(query, graph)
-    all_nodes: list[dict] = graph.get("nodes", [])
-    retrieved: list[dict] = result.get("nodes", [])
+    selected: list[str] = result.get("nodes_selected", [])
+    if not selected:
+        return "NO_CONTEXT_FOUND"
 
-    nodes = rank_and_select(retrieved or all_nodes, query)
+    node_dicts = resolve_nodes(selected, graph)
+    nodes = rank_and_select(node_dicts, query)
     if not nodes:
         return "NO_CONTEXT_FOUND"
 

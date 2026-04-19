@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .patcher import _extract_create_content, apply_file_diff, backup_file, generate_diff, parse_diff
 from .planner import plan
-from .ranker import format_output, rank_and_select
+from .ranker import format_output, rank_and_select, resolve_nodes
 from .retrieval import run_query
 from .validator import validate_no_duplicates, validate_patch
 
@@ -67,23 +67,24 @@ Return only code. No explanation.
 """
 
 
-def _deterministic_context(query: str, result: dict) -> str:
-    nodes: list[dict] = result.get("nodes", [])
-    if not nodes:
+def _deterministic_context(query: str, result: dict, graph: dict) -> str:
+    selected: list[str] = result.get("nodes_selected", [])
+    if not selected:
         return ""
-    ranked = rank_and_select(nodes, query)
+    node_dicts = resolve_nodes(selected, graph)
+    ranked = rank_and_select(node_dicts, query)
     if not ranked:
         return ""
     return format_output(query, ranked)
 
 
-def compress_context(query: str, result: dict) -> str:
+def compress_context(query: str, result: dict, graph: dict) -> str:
     """
     Compress retrieval output into minimal LLM context.
     Uses deterministic ranker first; optionally refines with Haiku.
     Falls back gracefully if anthropic is unavailable.
     """
-    deterministic = _deterministic_context(query, result)
+    deterministic = _deterministic_context(query, result, graph)
     if not deterministic.strip():
         return ""
 
@@ -102,7 +103,8 @@ def compress_context(query: str, result: dict) -> str:
             "content": f"User query: {query}\n\nCode graph + functions:\n{deterministic}",
         }],
     )
-    return message.content[0].text.strip()
+    block = message.content[0]
+    return block.text.strip() if hasattr(block, "text") else deterministic
 
 
 def _extract_fn_lists(result: dict) -> tuple[list[str], list[str]]:
@@ -131,7 +133,7 @@ def run_apply(
     # Step 1: Context extraction + compression
     echo("Step 1/5  Extracting and compressing context...")
     result = run_query(query, graph)
-    context = compress_context(query, result)
+    context = compress_context(query, result, graph)
     known_fns, missing_fns = _extract_fn_lists(result)
 
     if not context.strip():
