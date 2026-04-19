@@ -36,10 +36,11 @@ def get_context(query: str) -> str:
 
     result = run_query(query, graph)
     selected: list[str] = result.get("nodes_selected", [])
-    if not selected:
-        return "NO_CONTEXT_FOUND"
 
-    node_dicts = resolve_nodes(selected, graph)
+    # Fallback: expand to full graph when retrieval returns nothing
+    all_ids = [n["id"] for n in graph.get("nodes", []) if "id" in n]
+    pool_ids = selected if selected else all_ids
+    node_dicts = resolve_nodes(pool_ids, graph)
     nodes = rank_and_select(node_dicts, query)
     if not nodes:
         return "NO_CONTEXT_FOUND"

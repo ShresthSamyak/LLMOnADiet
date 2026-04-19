@@ -66,17 +66,30 @@ def _short_path(fpath: str) -> str:
 def _score(node: dict, query_tokens: set[str], alias_tokens: set[str]) -> int:
     if node.get("type") not in ("function", "method"):
         return 0
-    name = node.get("name", "")
+    name = node.get("name", "").lower()
     fpath = node.get("file", "").lower()
+    code = node.get("code", "").lower()
     name_tokens = _tokens(name)
 
     score = 0
-    if name.lower() in query_tokens or name_tokens == query_tokens:
+    # Exact / token match
+    if name in query_tokens or name_tokens == query_tokens:
         score += 3
     score += len(query_tokens & name_tokens) * 2
+    # Alias match
     score += len((alias_tokens - query_tokens) & name_tokens)
+    # Substring match: query token appears inside function name
+    for t in alias_tokens:
+        if len(t) >= 3 and t in name:
+            score += 1
+    # File path match
     if any(k in fpath for k in query_tokens):
         score += 2
+    # Docstring / body keyword match (light weight)
+    for t in query_tokens:
+        if len(t) >= 4 and t in code:
+            score += 1
+            break
     return score
 
 
@@ -115,6 +128,17 @@ def _compress(code: str, max_lines: int = 18) -> str:
     return "\n".join(lines)
 
 
+def _fallback_select(nodes: list[dict], top_n: int) -> list[dict]:
+    """Return top_n function nodes by call-graph centrality when scoring finds nothing."""
+    fn_nodes = [n for n in nodes if n.get("type") in ("function", "method")]
+    ranked = sorted(
+        fn_nodes,
+        key=lambda n: len(n.get("calls", [])) + len(n.get("callers", [])),
+        reverse=True,
+    )
+    return ranked[:top_n]
+
+
 def rank_and_select(nodes: list[dict], query: str, top_n: int = 3) -> list[dict]:
     query_tokens = _tokens(query)
     alias_tokens = _alias_tokens(query_tokens)
@@ -129,7 +153,7 @@ def rank_and_select(nodes: list[dict], query: str, top_n: int = 3) -> list[dict]
     top = [n for _, n in scored[:top_n]]
 
     if not top:
-        return []
+        return _fallback_select(nodes, top_n)
 
     top_names = {n.get("name") for n in top}
     by_name = {n.get("name"): n for n in nodes if n.get("name")}
