@@ -5,6 +5,38 @@
       "type": "file"
     },
     {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_deterministic_context",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "line": 70,
+      "code": "def _deterministic_context(query: str, result: dict) -> str:\n    \"\"\"Rank and format nodes using the deterministic ranker (no LLM).\"\"\"\n    nodes: list[dict] = result.get(\"nodes\", [])\n    if not nodes:\n        return \"\"\n    return format_output(query, nodes)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:compress_context",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "line": 78,
+      "code": "def compress_context(query: str, result: dict) -> str:\n    \"\"\"\n    Compress retrieval output into minimal LLM context.\n    Uses deterministic ranker first; optionally refines with Haiku.\n    Falls back gracefully if anthropic is unavailable.\n    \"\"\"\n    deterministic = _deterministic_context(query, result)\n    if not deterministic.strip():\n        return \"\"\n\n    try:\n        import anthropic\n    except ImportError:\n        return deterministic\n\n    client = anthropic.Anthropic()\n    message = client.messages.create(\n        model=\"claude-haiku-4-5-20251001\",\n        max_tokens=1024,\n        system=_COMPRESS_SYSTEM,\n        messages=[{\n            \"role\": \"user\",\n            \"content\": f\"User query: {query}\\n\\nCode graph + functions:\\n{deterministic}\",\n        }],\n    )\n    return message.content[0].text.strip()"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_extract_fn_lists",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "line": 106,
+      "code": "def _extract_fn_lists(result: dict) -> tuple[list[str], list[str]]:\n    \"\"\"Return (known_functions, missing_functions) from a query result.\"\"\"\n    kept: list[dict] = result.get(\"nodes\", [])\n    known = [n[\"name\"] for n in kept if n.get(\"name\")]\n    missing: list[str] = result.get(\"missing_deps\", [])\n    return known, missing"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "line": 114,
+      "code": "def run_apply(\n    query: str,\n    graph: dict,\n    project_root: Path,\n    dry_run: bool = False,\n    yes: bool = False,\n) -> int:\n    \"\"\"\n    Full apply pipeline: query \u2192 plan \u2192 diff \u2192 validate \u2192 apply.\n    Returns exit code (0 = success, 1 = error).\n    \"\"\"\n    from typer import echo, confirm\n\n    backup_dir = project_root / \".cecl\" / \"backups\"\n\n    # Step 1: Context extraction + compression\n    echo(\"Step 1/5  Extracting and compressing context...\")\n    result = run_query(query, graph)\n    context = compress_context(query, result)\n    known_fns, missing_fns = _extract_fn_lists(result)\n\n    if not context.strip():\n        echo(\"  No relevant context found in graph - proceeding with empty context.\")\n\n    # Step 2: Planning\n    echo(\"Step 2/5  Planning changes (Haiku)...\")\n    try:\n        steps = plan(query, context)\n    except RuntimeError as exc:\n        echo(f\"  Planning failed: {exc}\", err=True)\n        return 1\n\n    echo(f\"  {len(steps)} step(s) planned:\")\n    for s in steps:\n        echo(f\"    [{s['action'].upper()}] {s['file']} - {s['reason']}\")\n\n    # Step 3: Diff generation\n    echo(\"Step 3/5  Generating diffs (Sonnet)...\")\n    try:\n        diff_text = generate_diff(\n            query=query,\n            plan=steps,\n            compressed_context=context,\n            known_functions=known_fns,\n            missing_functions=missing_fns,\n            project_root=project_root,\n        )\n    except RuntimeError as exc:\n        echo(f\"  Diff generation failed: {exc}\", err=True)\n        return 1\n\n    diffs = parse_diff(diff_text)\n    if not diffs:\n        echo(\"  No diffs produced by LLM.\", err=True)\n        return 1\n\n    echo(f\"  {len(diffs)} file diff(s) parsed.\")\n\n    # Step 4: Validation\n    echo(\"Step 4/5  Validating diffs...\")\n    valid = True\n    patch_ops: list[tuple] = []  # (FileDiff, Path, str, str)\n\n    for diff in diffs:\n        original = \"\"\n        patched = \"\"\n        target = project_root / diff.relative_path\n        try:\n            target, original, patched = apply_file_diff(diff, project_root)\n        except FileNotFoundError as exc:\n            if diff.is_new_file:\n                target = project_root / diff.relative_path\n                original = \"\"\n                patched = _extract_create_content(diff.hunks)\n            else:\n                echo(f\"  ERROR: {exc}\", err=True)\n                valid = False\n                continue\n\n        vr = validate_patch(original, patched, diff.relative_path)\n        if not vr.ok:\n            echo(f\"  SYNTAX ERROR in {diff.relative_path}:\", err=True)\n            for err in vr.errors:\n                echo(f\"    {err}\", err=True)\n            valid = False\n            continue\n\n        if original:\n            vdup = validate_no_duplicates(original, patched[len(original):] if len(patched) > len(original) else \"\")\n            if not vdup.ok:\n                echo(f\"  DUPLICATE SYMBOL in {diff.relative_path}:\", err=True)\n                for err in vdup.errors:\n                    echo(f\"    {err}\", err=True)\n                valid = False\n                continue\n\n        echo(f\"  OK  {diff.relative_path}\")\n        patch_ops.append((diff, target, original, patched))\n\n    if not valid:\n        echo(\"Validation failed - no files written.\", err=True)\n        return 1\n\n    # Dry-run: show diffs only\n    if dry_run:\n        echo(\"\\n-- DRY RUN: diff preview --\")\n        echo(diff_text)\n        echo(\"-- No files written (--dry-run) --\")\n        return 0\n\n    # Step 5: Apply\n    if not yes:\n        files_list = \", \".join(str(t) for _, t, _, _ in patch_ops)\n        confirmed = confirm(f\"\\nApply changes to: {files_list}?\")\n        if not confirmed:\n            echo(\"Aborted.\")\n            return 0\n\n    echo(\"Step 5/5  Applying changes...\")\n    for _diff, target, original, patched in patch_ops:\n        if original:\n            bak = backup_file(target, backup_dir)\n            echo(f\"  Backed up {target.name} -> {bak.name}\")\n        target.parent.mkdir(parents=True, exist_ok=True)\n        target.write_text(patched, encoding=\"utf-8\")\n        action = \"Created\" if not original else \"Updated\"\n        echo(f\"  {action} {target}\")\n\n    echo(f\"\\nDone. {len(patch_ops)} file(s) modified. Backups in {backup_dir}\")\n    return 0"
+    },
+    {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
       "type": "file"
     },
@@ -12,36 +44,43 @@
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 30,
+      "line": 31,
       "code": "def _configure_logging(verbose: bool) -> None:\n    level = logging.DEBUG if verbose else logging.INFO\n    logging.basicConfig(\n        format=\"%(levelname)s  %(message)s\",\n        level=level,\n        stream=sys.stderr,\n    )"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_py_files",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 39,
+      "line": 40,
       "code": "def _collect_py_files(root: Path) -> list[Path]:\n    \"\"\"Walk root recursively, skipping ignored directories.\"\"\"\n    files: list[Path] = []\n    for path in root.rglob(\"*.py\"):\n        if any(part in IGNORE_DIRS for part in path.parts):\n            continue\n        files.append(path)\n    return sorted(files)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 50,
+      "line": 51,
       "code": "def index(\n    directory: Path = typer.Argument(\n        default=Path(\".\"),\n        help=\"Root directory to scan (default: current directory).\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Scan Python files and build a call graph saved to .cecl/graph.json.\"\"\"\n    _configure_logging(verbose)\n    logger = logging.getLogger(__name__)\n\n    logger.info(\"Scanning %s for Python files\u2026\", directory)\n    py_files = _collect_py_files(directory)\n    if not py_files:\n        typer.echo(\"No Python files found.\", err=True)\n        raise typer.Exit(code=1)\n\n    logger.info(\"Found %d files \u2014 parsing\u2026\", len(py_files))\n\n    results = []\n    errors = 0\n    for path in py_files:\n        result = parse_file(path)\n        if result is None:\n            errors += 1\n        else:\n            results.append(result)\n\n    logger.info(\"Parsed %d files (%d skipped due to errors).\", len(results), errors)\n\n    graph = build_graph(results)\n\n    out_dir = directory / OUTPUT_DIR\n    out_dir.mkdir(parents=True, exist_ok=True)\n    out_path = out_dir / OUTPUT_FILE\n    out_path.write_text(json.dumps(graph, indent=2), encoding=\"utf-8\")\n\n    node_counts = Counter(n[\"type\"] for n in graph[\"nodes\"])\n    edge_counts = Counter(e[\"type\"] for e in graph[\"edges\"])\n    typer.echo(f\"Graph saved -> {out_path}\")\n    typer.echo(\n        f\"  nodes : {len(graph['nodes'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(node_counts.items()))\n    )\n    typer.echo(\n        f\"  edges : {len(graph['edges'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(edge_counts.items()))\n    )"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 105,
+      "line": 106,
       "code": "def query(\n    query_str: str = typer.Argument(..., metavar=\"QUERY\", help=\"Natural-language query, e.g. 'fix login bug'.\"),\n    graph_path: Path = typer.Option(\n        Path(\".cecl/graph.json\"),\n        \"--graph\", \"-g\",\n        help=\"Path to graph.json produced by `index`.\",\n    ),\n    raw: bool = typer.Option(False, \"--raw\", help=\"Print full JSON result instead of formatted output.\"),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Query the code graph and return minimal relevant context.\"\"\"\n    _configure_logging(verbose)\n\n    if not graph_path.exists():\n        typer.echo(f\"Graph not found at {graph_path}. Run `context-engine index` first.\", err=True)\n        raise typer.Exit(code=1)\n\n    try:\n        graph = json.loads(graph_path.read_text(encoding=\"utf-8\"))\n    except json.JSONDecodeError as exc:\n        typer.echo(f\"Failed to parse {graph_path}: {exc}\", err=True)\n        raise typer.Exit(code=1)\n\n    result = run_query(query_str, graph)\n\n    if raw:\n        typer.echo(json.dumps(result, indent=2))\n        return\n\n    typer.echo(format_intent_output(result, graph))"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:apply",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "line": 139,
+      "code": "def apply(\n    query_str: str = typer.Argument(..., metavar=\"QUERY\", help=\"What to add or fix, e.g. 'add login endpoint'.\"),\n    graph_path: Path = typer.Option(\n        Path(\".cecl/graph.json\"),\n        \"--graph\", \"-g\",\n        help=\"Path to graph.json produced by `index`.\",\n    ),\n    root: Path = typer.Option(\n        Path(\".\"),\n        \"--root\", \"-r\",\n        help=\"Project root directory.\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    dry_run: bool = typer.Option(False, \"--dry-run\", help=\"Show diffs without writing files.\"),\n    yes: bool = typer.Option(False, \"--yes\", \"-y\", help=\"Skip confirmation prompt.\"),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Query, plan, generate diffs, validate, and apply code changes.\"\"\"\n    _configure_logging(verbose)\n\n    if not graph_path.exists():\n        typer.echo(f\"Graph not found at {graph_path}. Run `context-engine index` first.\", err=True)\n        raise typer.Exit(code=1)\n\n    try:\n        graph = json.loads(graph_path.read_text(encoding=\"utf-8\"))\n    except json.JSONDecodeError as exc:\n        typer.echo(f\"Failed to parse {graph_path}: {exc}\", err=True)\n        raise typer.Exit(code=1)\n\n    code = run_apply(query_str, graph, root, dry_run=dry_run, yes=yes)\n    raise typer.Exit(code=code)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:main",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 137,
-      "code": "def main() -> None:\n    app()"
+      "line": 176,
+      "code": "def main() -> None:\n    if hasattr(sys.stdout, \"reconfigure\"):\n        sys.stdout.reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    if hasattr(sys.stderr, \"reconfigure\"):\n        sys.stderr.reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    app()"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/compressor.py",
@@ -164,85 +203,204 @@
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:detect_intent",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 66,
+      "line": 67,
       "code": "def detect_intent(query: str) -> str:\n    \"\"\"Return one of: ``debug`` | ``explain`` | ``generate`` | ``lookup``.\n\n    Detection order: phrase patterns \u2192 single-word triggers \u2192 fallback (lookup).\n    Priority across intents: debug > explain > generate > lookup.\n    \"\"\"\n    q = query.lower()\n    tokens = set(q.split())\n\n    for intent in (\"debug\", \"explain\", \"generate\"):\n        for phrase in _INTENT_PHRASES.get(intent, ()):\n            if phrase in q:\n                return intent\n\n    for intent in (\"debug\", \"explain\", \"generate\"):\n        if tokens & _INTENT_WORDS[intent]:\n            return intent\n\n    return \"lookup\""
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:build_flow",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 91,
+      "line": 92,
       "code": "def build_flow(\n    nodes: list[Node],\n    edges: list[Edge],\n    entry_ids: list[str],\n) -> list[str]:\n    \"\"\"Return bare function/method names in topological call order.\n\n    Restricted to the kept function/method nodes and ``calls`` edges between\n    them.  Entry points seed the queue first.  Cycles are appended at the end.\n    \"\"\"\n    kept: dict[str, Node] = {\n        n[\"id\"]: n\n        for n in nodes\n        if n.get(\"type\") in (\"function\", \"method\")\n    }\n    if not kept:\n        return []\n\n    succ: dict[str, list[str]] = {nid: [] for nid in kept}\n    in_deg: dict[str, int] = {nid: 0 for nid in kept}\n    for edge in edges:\n        src, dst, etype = edge[\"from\"], edge[\"to\"], edge.get(\"type\", \"\")\n        if etype == \"calls\" and src in kept and dst in kept:\n            succ[src].append(dst)\n            in_deg[dst] += 1\n\n    # Seed queue: entry points with no internal callers first.\n    queue: deque[str] = deque()\n    queued: set[str] = set()\n    for eid in entry_ids:\n        if eid in kept and in_deg[eid] == 0:\n            queue.append(eid)\n            queued.add(eid)\n    for nid in kept:\n        if nid not in queued and in_deg[nid] == 0:\n            queue.append(nid)\n            queued.add(nid)\n\n    ordered: list[str] = []\n    visited: set[str] = set()\n    while queue:\n        nid = queue.popleft()\n        if nid in visited:\n            continue\n        visited.add(nid)\n        _, _, name = nid.rpartition(\":\")\n        ordered.append(name)\n        for callee in succ[nid]:\n            in_deg[callee] -= 1\n            if in_deg[callee] == 0 and callee not in visited:\n                queue.append(callee)\n\n    # Append cycle members last.\n    for nid in kept:\n        if nid not in visited:\n            _, _, name = nid.rpartition(\":\")\n            ordered.append(name)\n\n    return ordered"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:extract_failures",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 156,
+      "line": 157,
       "code": "def extract_failures(nodes: list[Node]) -> list[dict[str, str]]:\n    \"\"\"Scan code snippets for AST-level failure patterns.\n\n    Detected patterns\n    -----------------\n    * ``raise <Exc>``     \u2014 explicit exception raises.\n    * ``except <Exc>``    \u2014 exception handlers (potential silent swallowers).\n    * ``if <guard>: raise / return False/None``  \u2014 validation checks.\n\n    Returns a deduplicated list of ``{\"node\", \"kind\", \"detail\"}`` dicts.\n    \"\"\"\n    results: list[dict[str, str]] = []\n    seen: set[tuple[str, str, str]] = set()\n\n    def _add(node_name: str, kind: str, detail: str) -> None:\n        key = (node_name, kind, detail)\n        if key not in seen:\n            seen.add(key)\n            results.append({\"node\": node_name, \"kind\": kind, \"detail\": detail})\n\n    for node in nodes:\n        code = node.get(\"code\", \"\")\n        if not code:\n            continue\n        _, _, name = node[\"id\"].rpartition(\":\")\n\n        try:\n            tree = ast.parse(textwrap.dedent(code).strip())\n        except SyntaxError:\n            continue\n\n        for child in ast.walk(tree):\n            if isinstance(child, ast.Raise) and child.exc is not None:\n                try:\n                    exc_text = ast.unparse(child.exc)\n                except Exception:\n                    exc_text = \"...\"\n                _add(name, \"raises\", exc_text)\n\n            elif isinstance(child, ast.ExceptHandler) and child.type is not None:\n                try:\n                    exc_type = ast.unparse(child.type)\n                except Exception:\n                    exc_type = \"Exception\"\n                _add(name, \"catches\", exc_type)\n\n            elif isinstance(child, ast.If):\n                body_is_guard = any(\n                    isinstance(s, ast.Raise)\n                    or (\n                        isinstance(s, ast.Return)\n                        and (\n                            s.value is None\n                            or (isinstance(s.value, ast.Constant)\n                                and s.value.value in (False, None))\n                        )\n                    )\n                    for s in child.body\n                )\n                if body_is_guard:\n                    try:\n                        cond = ast.unparse(child.test)\n                    except Exception:\n                        cond = \"...\"\n                    _add(name, \"check\", cond)\n\n    return results"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:debug_hints",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 249,
+      "line": 250,
       "code": "def debug_hints(\n    failures: list[dict[str, str]],\n    keywords: list[str],\n) -> list[str]:\n    \"\"\"Return up to 6 actionable debug hints based on failures and keywords.\"\"\"\n    signal: set[str] = set(keywords)\n    for f in failures:\n        signal.update(f[\"detail\"].lower().split())\n\n    hints: list[str] = []\n    for trigger_set, hint in _HINT_RULES:\n        if trigger_set & signal:\n            hints.append(hint)\n\n    for f in failures:\n        if len(hints) >= 6:\n            break\n        if f[\"kind\"] == \"raises\":\n            hints.append(\n                f\"{f['node']} raises {f['detail']} \u2014 trace the call site\"\n            )\n        elif f[\"kind\"] == \"catches\":\n            hints.append(\n                f\"{f['node']} silently catches {f['detail']} \u2014 inspect handler\"\n            )\n\n    return hints[:6]"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:suggest_implementation",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 316,
+      "line": 317,
       "code": "def suggest_implementation(keywords: list[str]) -> list[str]:\n    \"\"\"Return ordered implementation steps for a generate-mode query.\"\"\"\n    kw = set(keywords)\n    if kw & {\"login\", \"auth\", \"authenticate\", \"signin\", \"jwt\", \"token\", \"password\"}:\n        return _GENERATE_TEMPLATES[\"auth\"]\n    if kw & {\"user\", \"account\", \"profile\", \"register\", \"signup\"}:\n        return _GENERATE_TEMPLATES[\"user\"]\n    if kw & {\"db\", \"database\", \"sql\", \"model\", \"schema\", \"migration\"}:\n        return _GENERATE_TEMPLATES[\"db\"]\n    return _GENERATE_TEMPLATES[\"default\"]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:find_integration_points",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 348,
+      "code": "def find_integration_points(nodes: list[Node]) -> list[str]:\n    \"\"\"Return unique file paths that look like router/API/endpoint modules.\"\"\"\n    seen: set[str] = set()\n    result: list[str] = []\n    for node in nodes:\n        fpath = node.get(\"file\", \"\")\n        if not fpath or fpath in seen:\n            continue\n        stem = re.split(r\"[/\\\\]\", fpath)[-1]\n        stem = re.sub(r\"\\.(py|js|ts)$\", \"\", stem, flags=re.IGNORECASE).lower()\n        if any(tok in stem for tok in _ROUTER_TOKENS):\n            seen.add(fpath)\n            result.append(fpath)\n    return result"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:group_components",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 364,
+      "code": "def group_components(nodes: list[Node]) -> dict[str, list[str]]:\n    \"\"\"Bucket function/method nodes into functional layers by name pattern.\"\"\"\n    groups: dict[str, list[str]] = {}\n    for node in nodes:\n        if node.get(\"type\") not in (\"function\", \"method\"):\n            continue\n        _, _, name = node[\"id\"].rpartition(\":\")\n        name_lower = name.lower()\n        placed = False\n        for layer_name, signals in _LAYER_SIGNALS:\n            if any(sig in name_lower for sig in signals):\n                groups.setdefault(layer_name, []).append(name)\n                placed = True\n                break\n        if not placed:\n            groups.setdefault(\"Other\", []).append(name)\n    return groups"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_detect_framework",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 383,
+      "code": "def _detect_framework(nodes: list[Node]) -> str:\n    \"\"\"Detect web framework from code snippets. Scans all supplied nodes.\"\"\"\n    for node in nodes:\n        code = node.get(\"code\", \"\")\n        if not code:\n            continue\n        if any(sig in code for sig in (\"APIRouter\", \"Depends(\", \"HTTPException\", \"fastapi\")):\n            return \"fastapi\"\n        if \"fastapi\" in code.lower():\n            return \"fastapi\"\n        if any(sig in code for sig in (\"Blueprint\", \"@app.route\", \"Flask(\")):\n            return \"flask\"\n        if \"flask\" in code.lower():\n            return \"flask\"\n        if any(sig in code for sig in (\"HttpResponse\", \"render(request\", \"models.Model\")):\n            return \"django\"\n        if \"django\" in code.lower():\n            return \"django\"\n    return \"generic\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_detect_async",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 408,
+      "code": "def _detect_async(nodes: list[Node]) -> bool:\n    \"\"\"Return True if any node contains real async code (not just docstring mentions).\"\"\"\n    for node in nodes:\n        code = node.get(\"code\", \"\")\n        if _ASYNC_PATTERN.search(code) or _AWAIT_PATTERN.search(code):\n            return True\n    return False"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_find_fn",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 417,
+      "code": "def _find_fn(nodes: list[Node], fallback: str, *signals: str) -> tuple[str, bool]:\n    \"\"\"Return (name, found_in_graph).\n\n    Searches function/method nodes for any name containing a signal token.\n    When not found, returns (fallback, False) so callers can surface MISSING.\n    \"\"\"\n    for node in nodes:\n        if node.get(\"type\") not in (\"function\", \"method\"):\n            continue\n        _, _, name = node[\"id\"].rpartition(\":\")\n        if any(sig in name.lower() for sig in signals):\n            return name, True\n    return fallback, False"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_short_path",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 432,
+      "code": "def _short_path(fpath: str) -> str:\n    \"\"\"Return last two path segments, forward-slash separated.\"\"\"\n    parts = re.split(r\"[/\\\\]\", fpath.strip())\n    return \"/\".join(p for p in parts[-2:] if p)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_auth_snippet",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 438,
+      "code": "def _gen_auth_snippet(\n    framework: str,\n    is_async: bool,\n    verify_fn: str,\n    token_fn: str,\n    user_fn: str,\n    db_fn: str,\n) -> str:\n    a = \"async \" if is_async else \"\"\n    aw = \"await \" if is_async else \"\"\n    if framework == \"fastapi\":\n        return (\n            f'router = APIRouter()\\n'\n            f'\\n'\n            f'\\n'\n            f'@router.post(\"/login\")\\n'\n            f'{a}def login(data: LoginRequest, db: AsyncSession = Depends({db_fn})):\\n'\n            f'    user = {aw}{user_fn}(db, data.email)\\n'\n            f'    if not user or not {verify_fn}(data.password, user.hashed_password):\\n'\n            f'        raise HTTPException(status_code=401, detail=\"Invalid credentials\")\\n'\n            f'    token = {token_fn}(subject=str(user.id))\\n'\n            f'    return {{\"access_token\": token, \"token_type\": \"bearer\"}}'\n        )\n    if framework == \"flask\":\n        return (\n            f'auth_bp = Blueprint(\"auth\", __name__)\\n'\n            f'\\n'\n            f'\\n'\n            f'@auth_bp.post(\"/login\")\\n'\n            f'def login():\\n'\n            f'    data = request.get_json()\\n'\n            f'    user = {user_fn}(data[\"email\"])\\n'\n            f'    if not user or not {verify_fn}(data[\"password\"], user.hashed_password):\\n'\n            f'        abort(401)\\n'\n            f'    token = {token_fn}(user.id)\\n'\n            f'    return jsonify({{\"access_token\": token, \"token_type\": \"bearer\"}})'\n        )\n    return (\n        f'{a}def login(email: str, password: str):\\n'\n        f'    user = {aw}{user_fn}(email)\\n'\n        f'    if not user or not {verify_fn}(password, user.hashed_password):\\n'\n        f'        raise AuthenticationError(\"Invalid credentials\")\\n'\n        f'    return {token_fn}(user.id)'\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_user_snippet",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 484,
+      "code": "def _gen_user_snippet(\n    framework: str,\n    is_async: bool,\n    user_fn: str,\n    db_fn: str,\n) -> str:\n    a = \"async \" if is_async else \"\"\n    aw = \"await \" if is_async else \"\"\n    if framework == \"fastapi\":\n        return (\n            f'router = APIRouter()\\n'\n            f'\\n'\n            f'\\n'\n            f'@router.post(\"/users\", status_code=201)\\n'\n            f'{a}def create_user(data: CreateUserRequest, db: AsyncSession = Depends({db_fn})):\\n'\n            f'    if {aw}{user_fn}(db, data.email):\\n'\n            f'        raise HTTPException(status_code=409, detail=\"Email already registered\")\\n'\n            f'    user = {aw}save_user(db, data)\\n'\n            f'    return user'\n        )\n    return (\n        f'{a}def create_user(email: str, password: str):\\n'\n        f'    if {aw}{user_fn}(email):\\n'\n        f'        raise ValueError(\"Email already registered\")\\n'\n        f'    return {aw}save_user(email=email, hashed_password=hash_password(password))'\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_db_snippet",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 512,
+      "code": "def _gen_db_snippet(is_async: bool) -> str:\n    if is_async:\n        return (\n            'class NewEntity(Base):\\n'\n            '    __tablename__ = \"new_entities\"\\n'\n            '    id = Column(Integer, primary_key=True)\\n'\n            '\\n'\n            'async def create_entity(db: AsyncSession, data: dict) -> NewEntity:\\n'\n            '    obj = NewEntity(**data)\\n'\n            '    db.add(obj)\\n'\n            '    await db.commit()\\n'\n            '    await db.refresh(obj)\\n'\n            '    return obj'\n        )\n    return (\n        'class NewEntity(Base):\\n'\n        '    __tablename__ = \"new_entities\"\\n'\n        '    id = Column(Integer, primary_key=True)\\n'\n        '\\n'\n        'def create_entity(db: Session, data: dict) -> NewEntity:\\n'\n        '    obj = NewEntity(**data)\\n'\n        '    db.add(obj)\\n'\n        '    db.commit()\\n'\n        '    db.refresh(obj)\\n'\n        '    return obj'\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_generic_snippet",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 540,
+      "code": "def _gen_generic_snippet(name: str, framework: str, is_async: bool) -> str:\n    fn_name = re.sub(r\"[^a-z0-9_]\", \"_\", name.lower()).strip(\"_\")\n    a = \"async \" if is_async else \"\"\n    aw = \"await \" if is_async else \"\"\n    if framework == \"fastapi\":\n        return (\n            f'@router.post(\"/{fn_name}\")\\n'\n            f'{a}def {fn_name}(data: dict):\\n'\n            f'    result = {aw}process_{fn_name}(data)\\n'\n            f'    return result'\n        )\n    return (\n        f'{a}def {fn_name}(data):\\n'\n        f'    result = {aw}process(data)\\n'\n        f'    return result'\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_code_snippet",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 558,
+      "code": "def generate_code_snippet(\n    keywords: list[str],\n    kept_nodes: list[Node],\n    all_nodes: list[Node],\n    framework: str,\n    is_async: bool,\n) -> tuple[str, list[str]]:\n    \"\"\"Generate code grounded in actual graph nodes; return (snippet, missing_deps).\n\n    Uses ``all_nodes`` (full graph) for existence checks so that functions which\n    exist in the graph but weren't in the pruned result set are NOT flagged as\n    missing.  Uses ``kept_nodes`` (query result) first to pick the most contextually\n    relevant function name, falling back to a search across ``all_nodes``.\n    \"\"\"\n    kw = set(keywords)\n\n    def _find_best(fallback: str, *signals: str) -> tuple[str, bool]:\n        \"\"\"Find in kept first, then all_nodes; check existence against all_nodes.\"\"\"\n        name, found = _find_fn(kept_nodes, fallback, *signals)\n        if not found:\n            name, found = _find_fn(all_nodes, fallback, *signals)\n        return name, found\n\n    verify_fn, verify_found = _find_best(\"verify_password\", \"verify\", \"check_password\", \"validate_password\")\n    token_fn, token_found = _find_best(\"create_access_token\", \"create_access\", \"generate_token\", \"create_token\", \"sign_token\")\n    user_fn, user_found = _find_best(\"get_user_by_email\", \"get_user\", \"find_user\", \"fetch_user\", \"lookup_user\")\n    db_fn, db_found = _find_best(\"get_db\", \"get_db\", \"get_session\", \"db_session\", \"get_connection\")\n\n    missing: list[str] = []\n\n    if kw & {\"login\", \"auth\", \"authenticate\", \"signin\", \"jwt\", \"token\", \"password\"}:\n        if not user_found:\n            missing.append(f\"{user_fn}(db, email)  # retrieve user record from DB\")\n        if not verify_found:\n            missing.append(f\"{verify_fn}(plain, hashed)  # password verification\")\n        if not token_found:\n            missing.append(f\"{token_fn}(subject)  # JWT generation\")\n        if not db_found and framework in (\"fastapi\", \"generic\"):\n            missing.append(f\"{db_fn}()  # async DB session dependency\")\n        return _gen_auth_snippet(framework, is_async, verify_fn, token_fn, user_fn, db_fn), missing\n\n    if kw & {\"user\", \"account\", \"profile\", \"register\", \"signup\"}:\n        if not user_found:\n            missing.append(f\"{user_fn}(db, email)  # check for existing user\")\n        if not db_found and framework == \"fastapi\":\n            missing.append(f\"{db_fn}()  # async DB session dependency\")\n        return _gen_user_snippet(framework, is_async, user_fn, db_fn), missing\n\n    if kw & {\"db\", \"database\", \"sql\", \"model\", \"schema\", \"migration\"}:\n        return _gen_db_snippet(is_async), missing\n\n    return _gen_generic_snippet(keywords[0] if keywords else \"feature\", framework, is_async), missing"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_file_to_module",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 616,
+      "code": "def _file_to_module(fpath: str) -> str:\n    \"\"\"Convert an absolute file path to a dotted Python import path.\n\n    Anchoring priority:\n    1. If \"app\" is a path segment, anchor there (FastAPI/Django project convention).\n    2. Otherwise find the first all-lowercase Python package name segment.\n\n    Example: ``C:/Users/HP/project/app/core/security.py`` \u2192 ``app.core.security``\n    Example: ``C:/Users/HP/project/context_engine/cli.py`` \u2192 ``context_engine.cli``\n    \"\"\"\n    normalized = fpath.replace(\"\\\\\", \"/\")\n    parts = normalized.split(\"/\")\n    if parts:\n        parts[-1] = re.sub(r\"\\.pyi?$\", \"\", parts[-1])\n    # Prefer \"app\" as anchor \u2014 avoids long system-path prefixes\n    if \"app\" in parts:\n        idx = parts.index(\"app\")\n        return \".\".join(p for p in parts[idx:] if p)\n    for i, part in enumerate(parts):\n        if re.match(r\"^[a-z][a-z0-9_]*$\", part):\n            return \".\".join(p for p in parts[i:] if p)\n    return \".\".join(p for p in parts if p)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:find_integration_target",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 640,
+      "code": "def find_integration_target(\n    all_nodes: list[Node],\n    keywords: list[str],\n) -> dict[str, str]:\n    \"\"\"Return the best existing file to add generated code to, or suggest a new one.\n\n    Returns ``{\"action\": \"add\"|\"create\", \"file\": \"<path>\"}``.\n    \"\"\"\n    router_files: list[str] = []\n    for node in all_nodes:\n        if node.get(\"type\") != \"file\":\n            continue\n        fpath = node[\"id\"]\n        stem = re.split(r\"[/\\\\]\", fpath)[-1]\n        stem = re.sub(r\"\\.(py|js|ts)$\", \"\", stem, flags=re.IGNORECASE).lower()\n        if any(tok in stem for tok in _ROUTER_TOKENS):\n            router_files.append(fpath)\n\n    kw = set(keywords)\n    if router_files:\n        for f in router_files:\n            f_lower = f.lower()\n            if kw & {\"login\", \"auth\", \"signin\"} and any(t in f_lower for t in (\"auth\", \"login\", \"security\")):\n                return {\"action\": \"add\", \"file\": _short_path(f)}\n        return {\"action\": \"add\", \"file\": _short_path(router_files[0])}\n\n    if kw & {\"login\", \"auth\", \"authenticate\", \"signin\"}:\n        return {\"action\": \"create\", \"file\": \"app/api/routes/auth.py\"}\n    if kw & {\"user\", \"account\", \"profile\", \"register\"}:\n        return {\"action\": \"create\", \"file\": \"app/api/routes/users.py\"}\n    return {\"action\": \"create\", \"file\": \"app/api/routes/new.py\"}"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_schema",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 673,
+      "code": "def generate_schema(keywords: list[str], framework: str) -> str:\n    \"\"\"Return a Pydantic BaseModel class definition for the request body.\n\n    Only emitted for FastAPI (the only framework where Pydantic request models\n    are idiomatic).  Returns an empty string for all other frameworks.\n    \"\"\"\n    if framework != \"fastapi\":\n        return \"\"\n    kw = set(keywords)\n    if kw & {\"login\", \"auth\", \"authenticate\", \"signin\"}:\n        return (\n            \"class LoginRequest(BaseModel):\\n\"\n            \"    email: str\\n\"\n            \"    password: str\"\n        )\n    if kw & {\"user\", \"register\", \"signup\", \"account\"}:\n        return (\n            \"class CreateUserRequest(BaseModel):\\n\"\n            \"    email: str\\n\"\n            \"    password: str\\n\"\n            \"    username: str | None = None\"\n        )\n    return \"\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_imports",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 706,
+      "code": "def generate_imports(\n    framework: str,\n    is_async: bool,\n    fn_names: list[str],\n    all_nodes: list[Node],\n    has_schema: bool = False,\n) -> list[str]:\n    \"\"\"Generate properly grouped import statements.\n\n    Group 1 \u2014 third-party (fastapi, pydantic, sqlalchemy, \u2026), alphabetical.\n    Group 2 \u2014 local project imports (one ``from <module> import \u2026`` per file).\n    Groups separated by a blank line.\n    \"\"\"\n    third_party: list[str] = []\n    if framework == \"fastapi\":\n        third_party.append(\"from fastapi import APIRouter, Depends, HTTPException\")\n        if has_schema:\n            third_party.append(\"from pydantic import BaseModel\")\n        if is_async:\n            third_party.append(\"from sqlalchemy.ext.asyncio import AsyncSession\")\n    elif framework == \"flask\":\n        third_party.append(\"from flask import Blueprint, abort, jsonify, request\")\n    elif has_schema:\n        third_party.append(\"from pydantic import BaseModel\")\n\n    # Build fn_name \u2192 source_file map from graph\n    file_map: dict[str, str] = {}\n    for node in all_nodes:\n        if node.get(\"type\") not in (\"function\", \"method\"):\n            continue\n        _, _, name = node[\"id\"].rpartition(\":\")\n        if name in fn_names and name not in file_map:\n            fpath = node.get(\"file\", \"\")\n            if fpath:\n                file_map[name] = fpath\n\n    # Group by module path, emit one from-import per module\n    module_fns: dict[str, list[str]] = {}\n    for name, fpath in file_map.items():\n        module = _file_to_module(fpath)\n        module_fns.setdefault(module, []).append(name)\n\n    local: list[str] = []\n    for module in sorted(module_fns):\n        # Skip any module that resolves to a known third-party package\n        pkg = module.split(\".\")[0]\n        if pkg in _THIRD_PARTY_PREFIXES:\n            continue\n        fns = \", \".join(sorted(module_fns[module]))\n        local.append(f\"from {module} import {fns}\")\n\n    lines: list[str] = []\n    lines.extend(third_party)\n    if third_party and local:\n        lines.append(\"\")\n    lines.extend(local)\n    return lines"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_missing_impl",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 809,
+      "code": "def generate_missing_impl(missing_deps: list[str], is_async: bool) -> str:\n    \"\"\"Return concatenated minimal implementations for each missing dependency.\"\"\"\n    impls: list[str] = []\n    for dep in missing_deps:\n        fn_name = dep.split(\"(\")[0].strip()\n        if fn_name in _MISSING_IMPL_TEMPLATES:\n            sync_impl, async_impl = _MISSING_IMPL_TEMPLATES[fn_name]\n            impls.append(async_impl if is_async else sync_impl)\n    return \"\\n\\n\".join(impls)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_debug_fix",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "line": 876,
+      "code": "def generate_debug_fix(\n    failures: list[dict[str, str]],\n    keywords: list[str],\n) -> tuple[list[str], list[str], str]:\n    \"\"\"Return (checks, root_causes, fix_code) for debug output.\n\n    Matches the combined keyword+failure signal against ``_DEBUG_FIX_RULES``.\n    Falls back to a generic trace snippet when no rule fires.\n    \"\"\"\n    signal: set[str] = set(keywords)\n    for f in failures:\n        signal.update(f[\"detail\"].lower().split())\n\n    for trigger_set, check, root_cause, fix in _DEBUG_FIX_RULES:\n        if trigger_set & signal:\n            return [check], [root_cause], fix\n\n    # Fallback: generate a minimal trace wrapper around the first failure site.\n    if failures:\n        f = failures[0]\n        if f[\"kind\"] == \"raises\":\n            fix = (\n                f\"try:\\n    result = {f['node']}(...)\\n\"\n                f\"except Exception as e:\\n    print(f'Error in {f['node']}: {{e}}')\\n    raise\"\n            )\n        elif f[\"kind\"] == \"catches\":\n            fix = (\n                f\"import logging\\nlogger = logging.getLogger(__name__)\\n\\n\"\n                f\"try:\\n    ...\\nexcept {f['detail']} as e:\\n\"\n                f\"    logger.exception('Unexpected error in {f['node']}')\\n    raise\"\n            )\n        else:\n            fix = f\"assert <condition>, '<condition> must hold before calling {f['node']}()'\"\n        return (\n            [f\"Inspect failure site: {f['node']}\"],\n            [f\"{f['node']} {f['kind']}: {f['detail']}\"],\n            fix,\n        )\n\n    return [], [], \"\""
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_bare",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 335,
+      "line": 925,
       "code": "def _bare(node_id: str) -> str:\n    _, _, name = node_id.rpartition(\":\")\n    return name or node_id"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_token_line",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 340,
+      "line": 930,
       "code": "def _token_line(result: Mapping[str, Any]) -> str:\n    rt = result.get(\"token_estimate_raw\", 0)\n    ct = result.get(\"token_estimate\", 0)\n    saved = 100 * (rt - ct) // rt if rt > 0 else 0\n    return f\"tokens        : ~{ct} (raw ~{rt}, -{saved}%)\""
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_debug",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 347,
-      "code": "def _format_debug(\n    result: Mapping[str, Any],\n    flow: list[str],\n    failures: list[dict[str, str]],\n) -> str:\n    lines: list[str] = [\n        \"intent        : DEBUG\",\n        f\"keywords      : {', '.join(result.get('keywords', []))}\",\n        \"\",\n    ]\n\n    if result.get(\"entry_points\"):\n        lines.append(\"ENTRY POINTS:\")\n        for ep in result[\"entry_points\"]:\n            lines.append(f\"  {_bare(ep)}\")\n        lines.append(\"\")\n\n    if flow:\n        lines += [\"CALL FLOW:\", \"  \" + \" -> \".join(flow), \"\"]\n\n    if failures:\n        lines.append(\"POTENTIAL FAILURES:\")\n        for f in failures:\n            if f[\"kind\"] == \"raises\":\n                lines.append(f\"  - {f['node']} raises {f['detail']}\")\n            elif f[\"kind\"] == \"catches\":\n                lines.append(f\"  - {f['node']} catches {f['detail']}\")\n            elif f[\"kind\"] == \"check\":\n                lines.append(f\"  - {f['node']}: guard on `{f['detail']}`\")\n        lines.append(\"\")\n\n    hints = debug_hints(failures, result.get(\"keywords\", []))\n    if hints:\n        lines.append(\"DEBUG HINTS:\")\n        for h in hints:\n            lines.append(f\"  - {h}\")\n        lines.append(\"\")\n\n    nodes_sel = result.get(\"nodes_selected\", [])\n    lines += [\n        f\"nodes         : {len(nodes_sel)}\",\n        _token_line(result),\n        \"\",\n    ]\n\n    if result.get(\"context\"):\n        lines += [_DIVIDER, result[\"context\"], _DIVIDER]\n\n    return \"\\n\".join(lines)"
+      "line": 937,
+      "code": "def _format_debug(\n    result: Mapping[str, Any],\n    flow: list[str],\n    failures: list[dict[str, str]],\n) -> str:\n    lines: list[str] = [\n        \"intent        : DEBUG\",\n        f\"keywords      : {', '.join(result.get('keywords', []))}\",\n        \"\",\n    ]\n\n    if result.get(\"entry_points\"):\n        lines.append(\"ENTRY POINTS:\")\n        for ep in result[\"entry_points\"]:\n            lines.append(f\"  {_bare(ep)}\")\n        lines.append(\"\")\n\n    # Annotated failure path\n    if flow:\n        failure_map: dict[str, list[str]] = {}\n        for f in failures:\n            if f[\"kind\"] == \"raises\":\n                note = f\"raises {f['detail']}\"\n            elif f[\"kind\"] == \"catches\":\n                note = f\"catches {f['detail']}\"\n            else:\n                note = f\"guards on `{f['detail']}`\"\n            failure_map.setdefault(f[\"node\"], []).append(note)\n\n        lines.append(\"FAILURE PATH:\")\n        for fn in flow:\n            notes = failure_map.get(fn, [])\n            suffix = \"  ->  \" + \", \".join(notes) if notes else \"  ->  OK\"\n            lines.append(f\"  {fn}{suffix}\")\n        lines.append(\"\")\n\n    checks, root_causes, fix_code = generate_debug_fix(failures, result.get(\"keywords\", []))\n\n    if checks:\n        lines.append(\"CHECK:\")\n        for c in checks:\n            lines.append(f\"  - {c}\")\n        lines.append(\"\")\n\n    if root_causes:\n        lines.append(\"ROOT CAUSE (LIKELY):\")\n        for rc in root_causes:\n            lines.append(f\"  - {rc}\")\n        lines.append(\"\")\n\n    if fix_code:\n        lines += [\"FIX:\", _DIVIDER, fix_code, _DIVIDER, \"\"]\n\n    nodes_sel = result.get(\"nodes_selected\", [])\n    lines += [\n        f\"nodes         : {len(nodes_sel)}\",\n        _token_line(result),\n        \"\",\n    ]\n\n    if result.get(\"context\"):\n        lines += [_DIVIDER, result[\"context\"], _DIVIDER]\n\n    return \"\\n\".join(lines)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_explain",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 398,
-      "code": "def _format_explain(\n    result: Mapping[str, Any],\n    flow: list[str],\n) -> str:\n    kws = result.get(\"keywords\", [])\n    domain = kws[0].upper() if kws else \"CODE\"\n\n    lines: list[str] = [\n        \"intent        : EXPLAIN\",\n        f\"keywords      : {', '.join(kws)}\",\n        \"\",\n        f\"{domain} FLOW:\",\n    ]\n\n    if flow:\n        for i, step in enumerate(flow, 1):\n            lines.append(f\"  {i}. {step}\")\n    else:\n        lines.append(\"  (no flow data \u2014 run `context-engine index` first)\")\n\n    lines += [\n        \"\",\n        f\"nodes         : {len(result.get('nodes_selected', []))}\",\n        _token_line(result),\n        \"\",\n    ]\n\n    if result.get(\"context\"):\n        lines += [_DIVIDER, result[\"context\"], _DIVIDER]\n\n    return \"\\n\".join(lines)"
+      "line": 1003,
+      "code": "def _format_explain(\n    result: Mapping[str, Any],\n    flow: list[str],\n) -> str:\n    kws = result.get(\"keywords\", [])\n    domain = kws[0].upper() if kws else \"CODE\"\n\n    lines: list[str] = [\n        \"intent        : EXPLAIN\",\n        f\"keywords      : {', '.join(kws)}\",\n        \"\",\n        f\"{domain} FLOW:\",\n    ]\n\n    if flow:\n        for i, step in enumerate(flow, 1):\n            lines.append(f\"  {i}. {step}\")\n    else:\n        lines.append(\"  (no flow data - run `context-engine index` first)\")\n\n    lines += [\n        \"\",\n        f\"nodes         : {len(result.get('nodes_selected', []))}\",\n        _token_line(result),\n        \"\",\n    ]\n\n    if result.get(\"context\"):\n        lines += [_DIVIDER, result[\"context\"], _DIVIDER]\n\n    return \"\\n\".join(lines)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 431,
-      "code": "def _format_generate(\n    result: Mapping[str, Any],\n    existing: list[str],\n) -> str:\n    kws = result.get(\"keywords\", [])\n\n    lines: list[str] = [\n        \"intent        : GENERATE\",\n        f\"keywords      : {', '.join(kws)}\",\n        \"\",\n    ]\n\n    if existing:\n        lines.append(\"EXISTING COMPONENTS:\")\n        for comp in existing:\n            lines.append(f\"  - {comp}\")\n        lines.append(\"\")\n\n    steps = suggest_implementation(kws)\n    lines.append(\"SUGGESTED IMPLEMENTATION:\")\n    for i, step in enumerate(steps, 1):\n        lines.append(f\"  {i}. {step}\")\n    lines.append(\"\")\n\n    if result.get(\"context\"):\n        lines += [\"EXISTING CODE:\", _DIVIDER, result[\"context\"], _DIVIDER]\n\n    return \"\\n\".join(lines)"
+      "line": 1036,
+      "code": "def _format_generate(\n    result: Mapping[str, Any],\n    kept_nodes: list[Node],\n    all_nodes: list[Node],\n) -> str:\n    kws = result.get(\"keywords\", [])\n    framework = _detect_framework(all_nodes)\n    is_async = _detect_async(all_nodes)\n    groups = group_components(kept_nodes)\n    target = find_integration_target(all_nodes, kws)\n    schema = generate_schema(kws, framework)\n    snippet, missing = generate_code_snippet(kws, kept_nodes, all_nodes, framework, is_async)\n\n    # Collect graph-verified function names referenced in the snippet for imports.\n    fn_names_in_snippet: list[str] = [\n        node[\"id\"].rpartition(\":\")[2]\n        for node in all_nodes\n        if node.get(\"type\") in (\"function\", \"method\")\n        and node[\"id\"].rpartition(\":\")[2] in snippet\n    ]\n    import_lines = generate_imports(framework, is_async, fn_names_in_snippet, all_nodes, has_schema=bool(schema))\n\n    concurrency = \"async\" if is_async else \"sync\"\n    lines: list[str] = [\n        \"INTENT:\",\n        \"GENERATE\",\n        \"\",\n        f\"framework     : {framework}  ({concurrency})\",\n        \"\",\n    ]\n\n    if groups:\n        lines.append(\"AUTH STACK:\" if kws and set(kws) & {\"login\", \"auth\", \"authenticate\", \"signin\", \"token\", \"jwt\"} else \"DETECTED STACK:\")\n        for layer, fns in groups.items():\n            lines.append(f\"  {layer}:\")\n            for fn in fns:\n                lines.append(f\"    - {fn}()\")\n        lines.append(\"\")\n\n    action_verb = \"Add to\" if target[\"action\"] == \"add\" else \"Create\"\n    lines += [\n        \"INTEGRATION TARGET:\",\n        f\"  {action_verb}: {target['file']}\",\n        \"\",\n    ]\n\n    if import_lines:\n        lines += [\"IMPORTS:\", _DIVIDER]\n        lines.extend(import_lines)\n        lines += [_DIVIDER, \"\"]\n\n    if schema:\n        lines += [\"SCHEMA:\", _DIVIDER, schema, _DIVIDER, \"\"]\n\n    lines += [\"GENERATED CODE:\", _DIVIDER, snippet, _DIVIDER, \"\"]\n\n    if missing:\n        missing_code = generate_missing_impl(missing, is_async)\n        if missing_code:\n            lines += [\"MISSING IMPLEMENTATION:\", _DIVIDER, missing_code, _DIVIDER, \"\"]\n        else:\n            # No template available \u2014 fall back to listing\n            lines.append(\"MISSING (implement before deploying):\")\n            for dep in missing:\n                lines.append(f\"  - {dep}\")\n            lines.append(\"\")\n\n    # Integration guidance\n    action_verb = \"Add to\" if target[\"action\"] == \"add\" else \"Create\"\n    insert_lines = [\n        \"INSERTION HINT:\",\n        f\"  1. {action_verb}: {target['file']}\",\n    ]\n    if framework == \"fastapi\":\n        insert_lines.append(\"  2. Register in main app:  app.include_router(router, prefix='/auth')\")\n    insert_lines.append(\"\")\n    lines.extend(insert_lines)\n\n    if result.get(\"context\"):\n        lines += [\"EXISTING CODE:\", _DIVIDER, result[\"context\"], _DIVIDER]\n\n    return \"\\n\".join(lines)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_lookup",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 461,
+      "line": 1120,
       "code": "def _format_lookup(result: Mapping[str, Any]) -> str:\n    lines: list[str] = [\n        \"intent        : LOOKUP\",\n        f\"keywords      : {', '.join(result.get('keywords', []))}\",\n        \"\",\n    ]\n\n    eps = result.get(\"entry_points\", [])\n    if eps:\n        lines.append(f\"entry points  : {len(eps)}\")\n        for ep in eps:\n            lines.append(f\"  * {_bare(ep)}\")\n        lines.append(\"\")\n\n    cat_counts = Counter(result.get(\"categories\", {}).values())\n    lines.append(\n        f\"nodes         : {len(result.get('nodes_selected', []))}  \"\n        + \"  \".join(f\"{k}={v}\" for k, v in sorted(cat_counts.items()))\n    )\n\n    inline_count = sum(len(v) for v in result.get(\"inline_hints\", {}).values())\n    if inline_count:\n        lines.append(f\"inline hints  : {inline_count}\")\n\n    lines += [\"\", _token_line(result), \"\"]\n\n    if result.get(\"context\"):\n        lines += [_DIVIDER, result[\"context\"], _DIVIDER]\n\n    return \"\\n\".join(lines)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:format_intent_output",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
-      "line": 497,
-      "code": "def format_intent_output(\n    result: Mapping[str, Any],\n    graph: Mapping[str, Any],\n) -> str:\n    \"\"\"Produce intent-aware CLI output for a query result.\n\n    Dispatches to one of four formatters:\n\n    * ``debug``    \u2192 CALL FLOW + POTENTIAL FAILURES + DEBUG HINTS + code\n    * ``explain``  \u2192 numbered FLOW + code\n    * ``generate`` \u2192 EXISTING COMPONENTS + SUGGESTED IMPLEMENTATION + code\n    * ``lookup``   \u2192 entry points + stats + code  (current behaviour)\n    \"\"\"\n    intent = result.get(\"intent\", \"lookup\")\n    all_nodes: dict[str, Any] = {n[\"id\"]: n for n in graph.get(\"nodes\", [])}\n    kept: list[Node] = [\n        all_nodes[nid]\n        for nid in result.get(\"nodes_selected\", [])\n        if nid in all_nodes\n    ]\n    edges: list[Edge] = graph.get(\"edges\", [])\n    entry_ids: list[str] = result.get(\"entry_points\", [])\n\n    flow = build_flow(kept, edges, entry_ids)\n    failures = extract_failures(kept)\n    existing = [_bare(nid) for nid in result.get(\"nodes_selected\", [])]\n\n    if intent == \"debug\":\n        return _format_debug(result, flow, failures)\n    if intent == \"explain\":\n        return _format_explain(result, flow)\n    if intent == \"generate\":\n        return _format_generate(result, existing)\n    return _format_lookup(result)"
+      "line": 1156,
+      "code": "def format_intent_output(\n    result: Mapping[str, Any],\n    graph: Mapping[str, Any],\n) -> str:\n    \"\"\"Produce intent-aware CLI output for a query result.\n\n    Dispatches to one of four formatters:\n\n    * ``debug``    \u2192 CALL FLOW + POTENTIAL FAILURES + DEBUG HINTS + code\n    * ``explain``  \u2192 numbered FLOW + code\n    * ``generate`` \u2192 EXISTING COMPONENTS + SUGGESTED IMPLEMENTATION + code\n    * ``lookup``   \u2192 entry points + stats + code  (current behaviour)\n    \"\"\"\n    intent = result.get(\"intent\", \"lookup\")\n    node_map: dict[str, Any] = {n[\"id\"]: n for n in graph.get(\"nodes\", [])}\n    graph_nodes: list[Node] = list(node_map.values())\n    kept: list[Node] = [\n        node_map[nid]\n        for nid in result.get(\"nodes_selected\", [])\n        if nid in node_map\n    ]\n    edges: list[Edge] = graph.get(\"edges\", [])\n    entry_ids: list[str] = result.get(\"entry_points\", [])\n\n    flow = build_flow(kept, edges, entry_ids)\n    failures = extract_failures(kept)\n\n    if intent == \"debug\":\n        return _format_debug(result, flow, failures)\n    if intent == \"explain\":\n        return _format_explain(result, flow)\n    if intent == \"generate\":\n        return _format_generate(result, kept, graph_nodes)\n    return _format_lookup(result)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
@@ -319,6 +477,89 @@
       "type": "class",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
       "line": 46
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:parse_diff",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 97,
+      "code": "def parse_diff(diff_text: str) -> list[FileDiff]:\n    \"\"\"Parse a unified diff string into FileDiff objects.\"\"\"\n    # Strip markdown fences if LLM wrapped output\n    diff_text = re.sub(r\"^```[^\\n]*\\n\", \"\", diff_text, flags=re.MULTILINE)\n    diff_text = re.sub(r\"^```\\s*$\", \"\", diff_text, flags=re.MULTILINE)\n\n    diffs: list[FileDiff] = []\n    current: FileDiff | None = None\n    current_hunk: Hunk | None = None\n\n    for line in diff_text.splitlines():\n        if line.startswith(\"--- \"):\n            if current_hunk and current:\n                current.hunks.append(current_hunk)\n                current_hunk = None\n            orig = line[4:].strip()\n            current = FileDiff(orig_path=orig, new_path=\"\")\n            diffs.append(current)\n        elif line.startswith(\"+++ \") and current is not None:\n            current.new_path = line[4:].strip()\n        elif line.startswith(\"@@ \") and current is not None:\n            if current_hunk:\n                current.hunks.append(current_hunk)\n            m = _HUNK_HEADER.match(line)\n            if m:\n                os_, oc, ns, nc = m.group(1), m.group(2), m.group(3), m.group(4)\n                current_hunk = Hunk(\n                    orig_start=int(os_),\n                    orig_count=int(oc) if oc is not None else 1,\n                    new_start=int(ns),\n                    new_count=int(nc) if nc is not None else 1,\n                )\n        elif current_hunk is not None:\n            if line.startswith((\"+\", \"-\", \" \")):\n                current_hunk.lines.append(line)\n            elif line == \"\\\\ No newline at end of file\":\n                pass  # ignore\n\n    if current_hunk and current:\n        current.hunks.append(current_hunk)\n\n    return [d for d in diffs if d.new_path]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:_apply_hunks",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 141,
+      "code": "def _apply_hunks(original: str, hunks: list[Hunk]) -> str:\n    \"\"\"Apply hunks to original text, returning patched text.\"\"\"\n    orig_lines = original.splitlines(keepends=True)\n    # Ensure lines end with newline for uniform handling\n    result: list[str] = []\n    offset = 0  # cumulative line offset from previous hunks\n\n    for hunk in sorted(hunks, key=lambda h: h.orig_start):\n        # Lines before this hunk (1-indexed \u2192 0-indexed)\n        hunk_start_0 = hunk.orig_start - 1 + offset\n        # Copy lines before hunk\n        result.extend(orig_lines[:hunk_start_0])\n        orig_lines = orig_lines[hunk_start_0:]\n\n        removed = 0\n        for hline in hunk.lines:\n            if hline.startswith(\" \"):\n                # context \u2014 keep\n                result.append(orig_lines[removed] if removed < len(orig_lines) else hline[1:] + \"\\n\")\n                removed += 1\n            elif hline.startswith(\"-\"):\n                # remove \u2014 skip\n                removed += 1\n            elif hline.startswith(\"+\"):\n                # add\n                content = hline[1:]\n                if not content.endswith(\"\\n\"):\n                    content += \"\\n\"\n                result.append(content)\n\n        orig_lines = orig_lines[removed:]\n        offset = offset  # recalculated implicitly via list slicing\n\n    result.extend(orig_lines)\n    text = \"\".join(result)\n    # Strip trailing newline added if original didn't have one\n    return text"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:_extract_create_content",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 180,
+      "code": "def _extract_create_content(hunks: list[Hunk]) -> str:\n    lines = []\n    for hunk in hunks:\n        for hline in hunk.lines:\n            if hline.startswith(\"+\"):\n                lines.append(hline[1:])\n    return \"\".join(lines)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:backup_file",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 189,
+      "code": "def backup_file(file_path: Path, backup_dir: Path) -> Path:\n    timestamp = datetime.now().strftime(\"%Y%m%d_%H%M%S\")\n    backup_dir.mkdir(parents=True, exist_ok=True)\n    dest = backup_dir / f\"{file_path.name}.{timestamp}.bak\"\n    shutil.copy2(file_path, dest)\n    return dest"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:apply_file_diff",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 197,
+      "code": "def apply_file_diff(diff: FileDiff, project_root: Path) -> tuple[Path, str, str]:\n    \"\"\"\n    Apply a FileDiff to disk.\n    Returns (target_path, original_content, patched_content).\n    \"\"\"\n    target = project_root / diff.relative_path\n\n    if diff.is_new_file:\n        original = \"\"\n        patched = _extract_create_content(diff.hunks)\n    else:\n        if not target.exists():\n            raise FileNotFoundError(f\"Target file not found: {target}\")\n        original = target.read_text(encoding=\"utf-8\")\n        patched = _apply_hunks(original, diff.hunks)\n\n    return target, original, patched"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:generate_diff",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 216,
+      "code": "def generate_diff(\n    query: str,\n    plan: list[dict],\n    compressed_context: str,\n    known_functions: list[str],\n    missing_functions: list[str],\n    project_root: Path,\n) -> str:\n    \"\"\"Call Anthropic Sonnet to generate a unified diff for the given plan.\"\"\"\n    try:\n        import anthropic\n    except ImportError as exc:\n        raise RuntimeError(\"anthropic package required: pip install anthropic>=0.40\") from exc\n\n    client = anthropic.Anthropic()\n\n    plan_text = \"\\n\".join(\n        f\"- {step.get('action', 'modify')} {step['file']}: {step.get('reason', '')}\"\n        for step in plan\n    )\n    known_text = \"\\n\".join(known_functions) if known_functions else \"none\"\n    missing_text = \"\\n\".join(missing_functions) if missing_functions else \"none\"\n\n    user_prompt = f\"\"\"\\\n## INPUT CONTEXT\n\n{compressed_context}\n\n---\n\n## TASK\n\n{query}\n\n## PLAN\n\n{plan_text}\n\n## KNOWN FUNCTIONS (use only these \u2014 do not invent names)\n\n{known_text}\n\n## MISSING FUNCTIONS (implement these minimally)\n\n{missing_text}\n\n## PROJECT ROOT\n\n{project_root}\n\nImplement the solution for the given task using the context above.\"\"\"\n\n    message = client.messages.create(\n        model=\"claude-sonnet-4-6\",\n        max_tokens=4096,\n        system=_CODEGEN_SYSTEM,\n        messages=[{\"role\": \"user\", \"content\": user_prompt}],\n    )\n\n    return message.content[0].text"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:Hunk",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 68
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 77
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff.is_new_file",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 83,
+      "code": "def is_new_file(self) -> bool:\n        return self.orig_path in (\"/dev/null\", \"a//dev/null\")"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff.relative_path",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "line": 87,
+      "code": "def relative_path(self) -> str:\n        p = self.new_path\n        if p.startswith(\"b/\"):\n            p = p[2:]\n        return p"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/planner.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/planner.py:plan",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/planner.py",
+      "line": 32,
+      "code": "def plan(query: str, context: str) -> list[dict]:\n    \"\"\"\n    Call Anthropic Haiku to generate a step-by-step plan.\n    Returns a list of {'file', 'action', 'reason'} dicts.\n    Raises RuntimeError if the anthropic package is missing or the response is malformed.\n    \"\"\"\n    try:\n        import anthropic\n    except ImportError as exc:\n        raise RuntimeError(\"anthropic package required: pip install anthropic>=0.40\") from exc\n\n    client = anthropic.Anthropic()\n\n    user_prompt = f\"\"\"TASK: {query}\n\nCODEBASE CONTEXT:\n{context}\n\nOutput the JSON plan now.\"\"\"\n\n    message = client.messages.create(\n        model=\"claude-haiku-4-5-20251001\",\n        max_tokens=1024,\n        system=_PLAN_SYSTEM,\n        messages=[{\"role\": \"user\", \"content\": user_prompt}],\n    )\n\n    raw = message.content[0].text.strip()\n\n    # Strip markdown fences if present\n    raw = re.sub(r\"^```[^\\n]*\\n\", \"\", raw, flags=re.MULTILINE)\n    raw = re.sub(r\"^```\\s*$\", \"\", raw, flags=re.MULTILINE)\n    raw = raw.strip()\n\n    try:\n        steps = json.loads(raw)\n    except json.JSONDecodeError as exc:\n        raise RuntimeError(f\"Planner returned invalid JSON: {exc}\\n\\nRaw response:\\n{raw}\") from exc\n\n    if not isinstance(steps, list):\n        raise RuntimeError(f\"Planner returned non-list JSON: {type(steps)}\")\n\n    validated: list[dict] = []\n    for i, step in enumerate(steps):\n        if not isinstance(step, dict):\n            continue\n        if \"file\" not in step or \"action\" not in step:\n            continue\n        validated.append({\n            \"file\": step[\"file\"],\n            \"action\": step.get(\"action\", \"modify\"),\n            \"reason\": step.get(\"reason\", \"\"),\n        })\n\n    if not validated:\n        raise RuntimeError(\"Planner returned zero valid steps.\")\n\n    return validated"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/pruner.py",
@@ -426,6 +667,87 @@
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/pruner.py",
       "line": 221,
       "code": "def visit_Attribute(self, node: ast.Attribute) -> ast.Attribute:\n        # Attribute access like `self.x` \u2192 `_.x` (keep attr names \u2014 they carry meaning)\n        self.generic_visit(node)\n        return node"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_keyword_score",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 36,
+      "code": "def _keyword_score(node: dict, query_tokens: set[str]) -> float:\n    name_tokens = set(re.split(r\"[_\\W]+\", node.get(\"name\", \"\").lower()))\n    file_tokens = set(re.split(r\"[/_\\W]+\", node.get(\"file\", \"\").lower()))\n    code = node.get(\"code\", \"\").lower()\n    hits = len(query_tokens & name_tokens) * 3\n    hits += len(query_tokens & file_tokens) * 1\n    hits += sum(1 for t in query_tokens if t in code)\n    return float(hits)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_centrality_score",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 46,
+      "code": "def _centrality_score(node: dict) -> float:\n    calls = len(node.get(\"calls\", []))\n    callers = len(node.get(\"callers\", []))\n    return min(calls + callers * 1.5, 10.0)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_file_score",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 52,
+      "code": "def _file_score(node: dict) -> float:\n    fpath = node.get(\"file\", \"\").lower()\n    score = 0.0\n    for keyword, weight in _FILE_IMPORTANCE.items():\n        if keyword in fpath:\n            score += weight\n    return score"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 61,
+      "code": "def rank_nodes(nodes: list[dict], query: str) -> list[dict]:\n    query_tokens = set(re.split(r\"\\W+\", query.lower())) - {\"\", \"a\", \"the\", \"in\", \"to\", \"for\"}\n    scored = []\n    for node in nodes:\n        score = (\n            _keyword_score(node, query_tokens) * 2.0\n            + _centrality_score(node) * 0.8\n            + _file_score(node) * 1.2\n        )\n        scored.append((score, node))\n    scored.sort(key=lambda x: x[0], reverse=True)\n    return [n for _, n in scored[:8]]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_args",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 75,
+      "code": "def _extract_args(code: str, name: str) -> str:\n    try:\n        tree = ast.parse(code)\n        for node in ast.walk(tree):\n            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:\n                args = [a.arg for a in node.args.args if a.arg != \"self\"]\n                defaults_offset = len(args) - len(node.args.defaults)\n                parts = []\n                for i, arg in enumerate(args):\n                    di = i - defaults_offset\n                    if di >= 0:\n                        parts.append(f\"{arg}=...\")\n                    else:\n                        parts.append(arg)\n                return \", \".join(parts)\n    except SyntaxError:\n        pass\n    m = re.search(rf\"def\\s+{re.escape(name)}\\s*\\(([^)]*)\\)\", code)\n    if m:\n        raw = m.group(1).replace(\"\\n\", \" \").strip()\n        args = [a.strip().split(\":\")[0].strip() for a in raw.split(\",\") if a.strip() and a.strip() != \"self\"]\n        return \", \".join(args)\n    return \"\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_infer_purpose",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 100,
+      "code": "def _infer_purpose(name: str, node_type: str) -> str:\n    tokens = re.split(r\"[_\\W]+\", name.lower())\n    for token in tokens:\n        if token in _PURPOSE_VERBS:\n            rest = [t for t in tokens if t != token]\n            subject = \"_\".join(rest) if rest else \"resource\"\n            return f\"{_PURPOSE_VERBS[token]} {subject}\"\n    if node_type == \"class\":\n        return \"data model / service class\"\n    return \"utility\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 112,
+      "code": "def summarize_node(node: dict) -> str:\n    name = node.get(\"name\", \"unknown\")\n    ntype = node.get(\"type\", \"function\")\n    code = node.get(\"code\", \"\")\n    fpath = node.get(\"file\", \"\")\n    short_path = \"/\".join(fpath.replace(\"\\\\\", \"/\").split(\"/\")[-2:]) if fpath else \"\"\n\n    if ntype == \"class\":\n        purpose = _infer_purpose(name, \"class\")\n        return f\"{name} [{short_path}] -> {purpose}\"\n\n    args = _extract_args(code, name)\n    purpose = _infer_purpose(name, \"function\")\n    prefix = \"async \" if re.search(r\"^\\s*async def\", code, re.MULTILINE) else \"\"\n    return f\"{prefix}{name}({args}) [{short_path}] -> {purpose}\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:build_flow",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 129,
+      "code": "def build_flow(nodes: list[dict]) -> str:\n    if not nodes:\n        return \"(no flow detected)\"\n\n    name_set = {n.get(\"name\") for n in nodes}\n    graph: dict[str, list[str]] = {\n        n[\"name\"]: [c for c in n.get(\"calls\", []) if c in name_set and c is not None]\n        for n in nodes if n.get(\"name\")\n    }\n\n    # Find root: node with no callers within the set\n    caller_targets = {c for targets in graph.values() for c in targets}\n    roots = [n for n in graph if n not in caller_targets]\n    start = roots[0] if roots else next(iter(graph), None)\n\n    if not start:\n        return \" -> \".join(n.get(\"name\", \"?\") for n in nodes[:4])\n\n    chain: list[str] = []\n    visited: set[str] = set()\n    current: str | None = start\n    while current and current not in visited and len(chain) < 4:\n        chain.append(current)\n        visited.add(current)\n        nxt = graph.get(current, [])\n        current = nxt[0] if nxt else None\n\n    return \" -> \".join(chain) if chain else start"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_constraints",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 159,
+      "code": "def _detect_constraints(nodes: list[dict]) -> list[str]:\n    combined = \" \".join(n.get(\"code\", \"\") for n in nodes)\n    found = []\n    for label, signals in _FRAMEWORK_SIGNALS.items():\n        if any(sig in combined for sig in signals):\n            found.append(label)\n    return found"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_missing",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 168,
+      "code": "def _detect_missing(nodes: list[dict]) -> list[str]:\n    defined = {n.get(\"name\") for n in nodes}\n    missing = set()\n    for node in nodes:\n        for call in node.get(\"calls\", []):\n            if call and call not in defined:\n                missing.add(call)\n    return sorted(missing)[:6]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 178,
+      "code": "def format_output(query: str, nodes: list[dict]) -> str:\n    ranked = rank_nodes(nodes, query)\n    flow = build_flow(ranked)\n    summaries = \"\\n\".join(summarize_node(n) for n in ranked)\n    missing = _detect_missing(ranked)\n    constraints = _detect_constraints(ranked)\n\n    missing_str = \", \".join(missing) if missing else \"none detected\"\n    constraints_str = \", \".join(constraints) if constraints else \"unknown\"\n\n    return (\n        f\"=== TASK ===\\n{query}\\n\\n\"\n        f\"=== CORE FLOW ===\\n{flow}\\n\\n\"\n        f\"=== KEY FUNCTIONS ===\\n{summaries}\\n\\n\"\n        f\"=== MISSING ===\\n{missing_str}\\n\\n\"\n        f\"=== CONSTRAINTS ===\\n{constraints_str}\"\n    )"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
@@ -589,9 +911,132 @@
       "type": "class",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
       "line": 26
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:_top_level_names",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "line": 15,
+      "code": "def _top_level_names(tree: ast.Module) -> set[str]:\n    return {\n        node.name\n        for node in ast.iter_child_nodes(tree)\n        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))\n    }"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_syntax",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "line": 23,
+      "code": "def validate_syntax(code: str, filename: str = \"<generated>\") -> ValidationResult:\n    \"\"\"Return ValidationResult with ok=False if code has a SyntaxError.\"\"\"\n    if not code.strip():\n        return ValidationResult(ok=True)\n    try:\n        ast.parse(code)\n        return ValidationResult(ok=True)\n    except SyntaxError as exc:\n        return ValidationResult(\n            ok=False,\n            errors=[f\"SyntaxError line {exc.lineno}: {exc.msg}\"],\n        )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_no_duplicates",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "line": 37,
+      "code": "def validate_no_duplicates(existing_code: str, additions: str) -> ValidationResult:\n    \"\"\"Ensure additions do not redefine top-level names already in existing_code.\"\"\"\n    if not existing_code.strip() or not additions.strip():\n        return ValidationResult(ok=True)\n    try:\n        existing_names = _top_level_names(ast.parse(existing_code))\n        new_names = _top_level_names(ast.parse(additions))\n    except SyntaxError:\n        return ValidationResult(ok=True)  # syntax validator handles this\n\n    duplicates = existing_names & new_names\n    if duplicates:\n        return ValidationResult(\n            ok=False,\n            errors=[f\"Would overwrite existing definitions: {', '.join(sorted(duplicates))}\"],\n        )\n    return ValidationResult(ok=True)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_patch",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "line": 56,
+      "code": "def validate_patch(original: str, patched: str, filename: str = \"<patched>\") -> ValidationResult:\n    \"\"\"Run all validations on the patched file content.\"\"\"\n    return validate_syntax(patched, filename)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:ValidationResult",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "line": 10
     }
   ],
   "edges": [
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_deterministic_context",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:compress_context",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_extract_fn_lists",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_deterministic_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:compress_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_deterministic_context",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:compress_context",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_extract_fn_lists",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:parse_diff",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/planner.py:plan",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:generate_diff",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_patch",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:apply_file_diff",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_no_duplicates",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:backup_file",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:_extract_create_content",
+      "type": "calls"
+    },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
@@ -610,6 +1055,11 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:apply",
       "type": "contains"
     },
     {
@@ -650,6 +1100,16 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:format_intent_output",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:apply",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
       "type": "calls"
     },
     {
@@ -834,6 +1294,91 @@
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:find_integration_points",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:group_components",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_detect_framework",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_detect_async",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_find_fn",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_short_path",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_auth_snippet",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_user_snippet",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_db_snippet",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_generic_snippet",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_code_snippet",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_file_to_module",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:find_integration_target",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_schema",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_imports",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_missing_impl",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_debug_fix",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_bare",
       "type": "contains"
     },
@@ -868,8 +1413,43 @@
       "type": "contains"
     },
     {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_code_snippet",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_find_fn",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_code_snippet",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_generic_snippet",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_code_snippet",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_auth_snippet",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_code_snippet",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_user_snippet",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_code_snippet",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_gen_db_snippet",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:find_integration_target",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_short_path",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_imports",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_file_to_module",
+      "type": "calls"
+    },
+    {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_debug",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:debug_hints",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_debug_fix",
       "type": "calls"
     },
     {
@@ -889,7 +1469,42 @@
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:suggest_implementation",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_detect_framework",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_detect_async",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:group_components",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:find_integration_target",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_schema",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_code_snippet",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_imports",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:generate_missing_impl",
       "type": "calls"
     },
     {
@@ -915,11 +1530,6 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:format_intent_output",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_lookup",
-      "type": "calls"
-    },
-    {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:format_intent_output",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_bare",
       "type": "calls"
     },
     {
@@ -1041,6 +1651,81 @@
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:MethodInfo",
       "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:parse_diff",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:_apply_hunks",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:_extract_create_content",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:backup_file",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:apply_file_diff",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:generate_diff",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:Hunk",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff.is_new_file",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff.relative_path",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:parse_diff",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:FileDiff",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:parse_diff",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:Hunk",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:apply_file_diff",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:_extract_create_content",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:apply_file_diff",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/patcher.py:_apply_hunks",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/planner.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/planner.py:plan",
+      "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/pruner.py",
@@ -1210,6 +1895,111 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/pruner.py:prune",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/pruner.py:_structural_key",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_keyword_score",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_centrality_score",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_file_score",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_args",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_infer_purpose",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:build_flow",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_constraints",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_missing",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_file_score",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_keyword_score",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_centrality_score",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_args",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_infer_purpose",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:build_flow",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_missing",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_constraints",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
       "type": "calls"
     },
     {
@@ -1490,6 +2280,51 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:estimate_tokens",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:_top_level_names",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_syntax",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_no_duplicates",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_patch",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:ValidationResult",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_syntax",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:ValidationResult",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_no_duplicates",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:ValidationResult",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_no_duplicates",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:_top_level_names",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_patch",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_syntax",
       "type": "calls"
     }
   ]

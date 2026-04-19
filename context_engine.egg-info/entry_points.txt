@@ -1,2 +1,3 @@
 [console_scripts]
 context-engine = context_engine.cli:main
+context-engine-mcp = context_engine.mcp_server:mcp.run
