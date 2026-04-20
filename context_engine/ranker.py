@@ -134,6 +134,17 @@ def _extract_docstring(code: str) -> str:
     return ""
 
 
+def _endpoint_relevance(node: dict, alias_tokens: set[str]) -> int:
+    """Extra score when an endpoint's route path matches query intent."""
+    code = node.get("code", "").lower()
+    # Find route path strings in decorator args
+    paths = re.findall(r'["\'](/[^"\']*)["\']', code)
+    for path in paths:
+        if any(t in path for t in alias_tokens if len(t) >= 3):
+            return 2
+    return 0
+
+
 def _score(node: dict, query_tokens: set[str], alias_tokens: set[str]) -> int:
     if node.get("type") not in ("function", "method"):
         return 0
@@ -155,13 +166,16 @@ def _score(node: dict, query_tokens: set[str], alias_tokens: set[str]) -> int:
     for t in alias_tokens:
         if len(t) >= 3 and t in name:
             score += 1
+    # Endpoint: base boost + intent-matched route path
+    if _is_endpoint(node):
+        score += 2 + _endpoint_relevance(node, alias_tokens)
     # File path: query OR alias token in path
     if any(k in fpath for k in alias_tokens):
         score += 2
     # Auth-module priority boost
     if any(k in fpath for k in _AUTH_MODULE_KEYWORDS):
         score += 1
-    # Docstring match against alias tokens (catches semantic descriptions)
+    # Docstring match against alias tokens
     for t in alias_tokens:
         if len(t) >= 4 and t in docstring:
             score += 1
