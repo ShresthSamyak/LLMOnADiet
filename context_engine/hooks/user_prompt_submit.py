@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -18,6 +19,7 @@ _GRAPH_PATH = Path(".cecl/graph.json")
 _TOKEN_BUDGET = 800   # ~800 tokens max (chars // 4)
 _MAX_NODES = 5
 _BODY_LINES = 10      # lines per function body
+_LOG_PATH = Path(".llm_diet/logs/hook_debug.log")
 
 
 def _load_graph() -> dict | None:
@@ -95,6 +97,20 @@ def _format_node(node: dict, budget_chars: int) -> tuple[str, int]:
     return block, len(block)
 
 
+def _log(query: str, n_nodes: int, tokens: int, preview: str) -> None:
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        line = (
+            f"[{ts}] query={repr(query)} nodes={n_nodes} "
+            f"tokens={tokens} preview={repr(preview[:100])}\n"
+        )
+        with _LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
 def _build_context(nodes: list[dict]) -> str:
     blocks: list[str] = []
     remaining = _TOKEN_BUDGET * 4  # chars
@@ -138,6 +154,7 @@ def main() -> None:
         sys.exit(0)
 
     context = _build_context(ranked)
+    _log(query, len(ranked), len(context) // 4, context)
     if context.strip():
         sys.stdout.write(json.dumps({"additionalContext": context}))
 
