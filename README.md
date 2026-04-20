@@ -1,5 +1,8 @@
-# context-engine 🧠
+# context-engine 
 > Cut your AI coding costs by 99%. Inject only the code that matters.
+
+![demo](demo/demo.gif)
+> *Record your own: `bash demo/record_demo.sh`*
 
 ## Benchmark (this repo, 185 nodes)
 
@@ -15,6 +18,21 @@
 | add logging to the pipeline | 46,661 | 58 | 99.9% | 1 | cli.py | 141 |
 
 **46,661 tokens → 275 tokens average. Same accuracy. 176ms overhead.**
+
+## Benchmark (external repo — fastapi, 946k token codebase)
+
+| Query | Baseline Tokens | With CE Tokens | Reduction % | Nodes | Files Selected | Time (ms) |
+|-------|----------------|----------------|-------------|-------|----------------|----------|
+| fix authentication bug | 946,210 | 87 | >99.9% | 1 | api_key.py | 359 |
+| add a new API endpoint | 946,210 | 120 | >99.9% | 1 | api_key.py | 359 |
+| how does the database connection work | 946,210 | 130 | >99.9% | 2 | tutorial001_an_py310.py, param_functions.py | 391 |
+| debug memory leak | 946,210 | 436 | >99.9% | 5 | applications.py, test_arbitrary_types.py, … | 1062 |
+| add input validation | 946,210 | 244 | >99.9% | 3 | utils.py, tutorial004_py310.py, … | 375 |
+| explain the caching logic | 946,210 | 114 | >99.9% | 1 | test_security_scopes_sub_dependency.py | 313 |
+| fix error handling | 946,210 | 221 | >99.9% | 3 | tutorial003_py310.py, tutorial002_py310.py, … | 406 |
+| add logging to the pipeline | 946,210 | 136 | >99.9% | 1 | tutorial002_an_py310.py | 328 |
+
+**946,210 tokens → 186 tokens average. Repo never seen before. 449ms overhead.**
 
 ## How it works
 
