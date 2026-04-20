@@ -487,6 +487,7 @@ def find_entry_points(
     nodes: list[Node],
     edges: list[Edge] | None = None,
     max_entries: int = _MAX_ENTRIES,
+    _debug: dict | None = None,
 ) -> list[str]:
     """Return the top-*max_entries* (default 5) strictly-qualified entry nodes.
 
@@ -537,6 +538,9 @@ def find_entry_points(
     apply_module_gate = bool(_strong_domain_kws)
 
     scored: list[tuple[int, int, str]] = []
+    _all_raw: list[tuple[int, str]] = []   # (score, nid) — for debug only
+    _gated_out = 0
+
     for node in nodes:
         nid = node["id"]
         file_part, _, _ = nid.rpartition(":")
@@ -545,12 +549,25 @@ def find_entry_points(
 
         # ── Hard module pre-filter (auth-domain queries only) ───────────────
         if apply_module_gate and not _is_relevant_module(file_part, kw_weights):
+            _gated_out += 1
+            if _debug is not None:
+                s_raw = _score_node(node, kw_weights, fan_in)
+                _all_raw.append((s_raw, nid))
             continue
         # ──────────────────────────────────────────────────────────────────
 
         s = _score_node(node, kw_weights, fan_in)
+        _all_raw.append((s, nid))
         if s >= _ENTRY_MIN_SCORE:
             scored.append((-s, _type_preference(node["type"]), node["id"]))
+
+    if _debug is not None:
+        top5 = sorted(_all_raw, key=lambda t: -t[0])[:5]
+        _debug["top_candidates"] = top5
+        _debug["apply_module_gate"] = apply_module_gate
+        _debug["module_gated_out"] = _gated_out
+        _debug["candidates_passed_gate"] = len(_all_raw) - _gated_out
+        _debug["candidates_above_threshold"] = len(scored)
 
     if not scored:
         return []
@@ -975,7 +992,7 @@ def estimate_tokens(text: str) -> int:
 # Public API
 # ---------------------------------------------------------------------------
 
-def run_query(query: str, graph: Graph, compress: bool = True) -> QueryResult:
+def run_query(query: str, graph: Graph, compress: bool = True, _debug: dict | None = None) -> QueryResult:
     """Full retrieval pipeline: query string + graph → QueryResult.
 
     Pipeline: parse → **expand** → entry-points → BFS traversal → rank →
@@ -1013,13 +1030,16 @@ def run_query(query: str, graph: Graph, compress: bool = True) -> QueryResult:
     nodes: list[Node] = graph["nodes"]
     edges: list[Edge] = graph["edges"]
 
-    entry_ids = find_entry_points(keywords, nodes, edges)
+    entry_ids = find_entry_points(keywords, nodes, edges, _debug=_debug)
 
     # find_entry_points returns [] when keywords were provided but no node
     # satisfied the hard gate (name OR file must contain a primary keyword).
     # Proceeding with an empty entry list would produce meaningless traversal;
     # return an empty result instead so the caller can surface a clear signal.
     if not entry_ids:
+        if _debug is not None:
+            _debug.setdefault("bfs_expanded", 0)
+            _debug.setdefault("after_pruner", [])
         return QueryResult(
             intent=intent,
             keywords=keywords,
@@ -1037,6 +1057,10 @@ def run_query(query: str, graph: Graph, compress: bool = True) -> QueryResult:
 
     # Narrow candidates into a minimal, categorised set.
     result: PruneResult = prune(ranked, entry_ids, visited)
+
+    if _debug is not None:
+        _debug["bfs_expanded"] = len(visited)
+        _debug["after_pruner"] = [n["id"] for n in result.kept]
 
     context_text = build_context(
         result.kept,

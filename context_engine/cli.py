@@ -112,6 +112,7 @@ def query(
     ),
     raw: bool = typer.Option(False, "--raw", help="Print full JSON result instead of formatted output."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+    debug: bool = typer.Option(False, "--debug", help="Print retrieval diagnostics: top candidates, BFS count, pruner output."),
 ) -> None:
     """Query the code graph and return minimal relevant context."""
     _configure_logging(verbose)
@@ -126,7 +127,11 @@ def query(
         typer.echo(f"Failed to parse {graph_path}: {exc}", err=True)
         raise typer.Exit(code=1)
 
-    result = run_query(query_str, graph)
+    debug_info: dict | None = {} if debug else None
+    result = run_query(query_str, graph, _debug=debug_info)
+
+    if debug and debug_info is not None:
+        _print_debug(debug_info)
 
     if raw:
         typer.echo(json.dumps(result, indent=2))
