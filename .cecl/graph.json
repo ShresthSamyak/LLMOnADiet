@@ -13,28 +13,28 @@
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
       "line": 70,
-      "code": "def _deterministic_context(query: str, result: dict) -> str:\n    \"\"\"Rank and format nodes using the deterministic ranker (no LLM).\"\"\"\n    nodes: list[dict] = result.get(\"nodes\", [])\n    if not nodes:\n        return \"\"\n    return format_output(query, nodes)"
+      "code": "def _deterministic_context(query: str, result: dict, graph: dict) -> str:\n    selected: list[str] = result.get(\"nodes_selected\", [])\n    if not selected:\n        return \"\"\n    node_dicts = resolve_nodes(selected, graph)\n    ranked = rank_and_select(node_dicts, query)\n    if not ranked:\n        return \"\"\n    return format_output(query, ranked)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:compress_context",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
-      "line": 78,
-      "code": "def compress_context(query: str, result: dict) -> str:\n    \"\"\"\n    Compress retrieval output into minimal LLM context.\n    Uses deterministic ranker first; optionally refines with Haiku.\n    Falls back gracefully if anthropic is unavailable.\n    \"\"\"\n    deterministic = _deterministic_context(query, result)\n    if not deterministic.strip():\n        return \"\"\n\n    try:\n        import anthropic\n    except ImportError:\n        return deterministic\n\n    client = anthropic.Anthropic()\n    message = client.messages.create(\n        model=\"claude-haiku-4-5-20251001\",\n        max_tokens=1024,\n        system=_COMPRESS_SYSTEM,\n        messages=[{\n            \"role\": \"user\",\n            \"content\": f\"User query: {query}\\n\\nCode graph + functions:\\n{deterministic}\",\n        }],\n    )\n    return message.content[0].text.strip()"
+      "line": 81,
+      "code": "def compress_context(query: str, result: dict, graph: dict) -> str:\n    \"\"\"\n    Compress retrieval output into minimal LLM context.\n    Uses deterministic ranker first; optionally refines with Haiku.\n    Falls back gracefully if anthropic is unavailable.\n    \"\"\"\n    deterministic = _deterministic_context(query, result, graph)\n    if not deterministic.strip():\n        return \"\"\n\n    try:\n        import anthropic\n    except ImportError:\n        return deterministic\n\n    client = anthropic.Anthropic()\n    message = client.messages.create(\n        model=\"claude-haiku-4-5-20251001\",\n        max_tokens=1024,\n        system=_COMPRESS_SYSTEM,\n        messages=[{\n            \"role\": \"user\",\n            \"content\": f\"User query: {query}\\n\\nCode graph + functions:\\n{deterministic}\",\n        }],\n    )\n    block = message.content[0]\n    return block.text.strip() if hasattr(block, \"text\") else deterministic"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_extract_fn_lists",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
-      "line": 106,
+      "line": 110,
       "code": "def _extract_fn_lists(result: dict) -> tuple[list[str], list[str]]:\n    \"\"\"Return (known_functions, missing_functions) from a query result.\"\"\"\n    kept: list[dict] = result.get(\"nodes\", [])\n    known = [n[\"name\"] for n in kept if n.get(\"name\")]\n    missing: list[str] = result.get(\"missing_deps\", [])\n    return known, missing"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
-      "line": 114,
-      "code": "def run_apply(\n    query: str,\n    graph: dict,\n    project_root: Path,\n    dry_run: bool = False,\n    yes: bool = False,\n) -> int:\n    \"\"\"\n    Full apply pipeline: query \u2192 plan \u2192 diff \u2192 validate \u2192 apply.\n    Returns exit code (0 = success, 1 = error).\n    \"\"\"\n    from typer import echo, confirm\n\n    backup_dir = project_root / \".cecl\" / \"backups\"\n\n    # Step 1: Context extraction + compression\n    echo(\"Step 1/5  Extracting and compressing context...\")\n    result = run_query(query, graph)\n    context = compress_context(query, result)\n    known_fns, missing_fns = _extract_fn_lists(result)\n\n    if not context.strip():\n        echo(\"  No relevant context found in graph - proceeding with empty context.\")\n\n    # Step 2: Planning\n    echo(\"Step 2/5  Planning changes (Haiku)...\")\n    try:\n        steps = plan(query, context)\n    except RuntimeError as exc:\n        echo(f\"  Planning failed: {exc}\", err=True)\n        return 1\n\n    echo(f\"  {len(steps)} step(s) planned:\")\n    for s in steps:\n        echo(f\"    [{s['action'].upper()}] {s['file']} - {s['reason']}\")\n\n    # Step 3: Diff generation\n    echo(\"Step 3/5  Generating diffs (Sonnet)...\")\n    try:\n        diff_text = generate_diff(\n            query=query,\n            plan=steps,\n            compressed_context=context,\n            known_functions=known_fns,\n            missing_functions=missing_fns,\n            project_root=project_root,\n        )\n    except RuntimeError as exc:\n        echo(f\"  Diff generation failed: {exc}\", err=True)\n        return 1\n\n    diffs = parse_diff(diff_text)\n    if not diffs:\n        echo(\"  No diffs produced by LLM.\", err=True)\n        return 1\n\n    echo(f\"  {len(diffs)} file diff(s) parsed.\")\n\n    # Step 4: Validation\n    echo(\"Step 4/5  Validating diffs...\")\n    valid = True\n    patch_ops: list[tuple] = []  # (FileDiff, Path, str, str)\n\n    for diff in diffs:\n        original = \"\"\n        patched = \"\"\n        target = project_root / diff.relative_path\n        try:\n            target, original, patched = apply_file_diff(diff, project_root)\n        except FileNotFoundError as exc:\n            if diff.is_new_file:\n                target = project_root / diff.relative_path\n                original = \"\"\n                patched = _extract_create_content(diff.hunks)\n            else:\n                echo(f\"  ERROR: {exc}\", err=True)\n                valid = False\n                continue\n\n        vr = validate_patch(original, patched, diff.relative_path)\n        if not vr.ok:\n            echo(f\"  SYNTAX ERROR in {diff.relative_path}:\", err=True)\n            for err in vr.errors:\n                echo(f\"    {err}\", err=True)\n            valid = False\n            continue\n\n        if original:\n            vdup = validate_no_duplicates(original, patched[len(original):] if len(patched) > len(original) else \"\")\n            if not vdup.ok:\n                echo(f\"  DUPLICATE SYMBOL in {diff.relative_path}:\", err=True)\n                for err in vdup.errors:\n                    echo(f\"    {err}\", err=True)\n                valid = False\n                continue\n\n        echo(f\"  OK  {diff.relative_path}\")\n        patch_ops.append((diff, target, original, patched))\n\n    if not valid:\n        echo(\"Validation failed - no files written.\", err=True)\n        return 1\n\n    # Dry-run: show diffs only\n    if dry_run:\n        echo(\"\\n-- DRY RUN: diff preview --\")\n        echo(diff_text)\n        echo(\"-- No files written (--dry-run) --\")\n        return 0\n\n    # Step 5: Apply\n    if not yes:\n        files_list = \", \".join(str(t) for _, t, _, _ in patch_ops)\n        confirmed = confirm(f\"\\nApply changes to: {files_list}?\")\n        if not confirmed:\n            echo(\"Aborted.\")\n            return 0\n\n    echo(\"Step 5/5  Applying changes...\")\n    for _diff, target, original, patched in patch_ops:\n        if original:\n            bak = backup_file(target, backup_dir)\n            echo(f\"  Backed up {target.name} -> {bak.name}\")\n        target.parent.mkdir(parents=True, exist_ok=True)\n        target.write_text(patched, encoding=\"utf-8\")\n        action = \"Created\" if not original else \"Updated\"\n        echo(f\"  {action} {target}\")\n\n    echo(f\"\\nDone. {len(patch_ops)} file(s) modified. Backups in {backup_dir}\")\n    return 0"
+      "line": 118,
+      "code": "def run_apply(\n    query: str,\n    graph: dict,\n    project_root: Path,\n    dry_run: bool = False,\n    yes: bool = False,\n) -> int:\n    \"\"\"\n    Full apply pipeline: query \u2192 plan \u2192 diff \u2192 validate \u2192 apply.\n    Returns exit code (0 = success, 1 = error).\n    \"\"\"\n    from typer import echo, confirm\n\n    backup_dir = project_root / \".cecl\" / \"backups\"\n\n    # Step 1: Context extraction + compression\n    echo(\"Step 1/5  Extracting and compressing context...\")\n    result = run_query(query, graph)\n    context = compress_context(query, result, graph)\n    known_fns, missing_fns = _extract_fn_lists(result)\n\n    if not context.strip():\n        echo(\"  No relevant context found in graph - proceeding with empty context.\")\n\n    # Step 2: Planning\n    echo(\"Step 2/5  Planning changes (Haiku)...\")\n    try:\n        steps = plan(query, context)\n    except RuntimeError as exc:\n        echo(f\"  Planning failed: {exc}\", err=True)\n        return 1\n\n    echo(f\"  {len(steps)} step(s) planned:\")\n    for s in steps:\n        echo(f\"    [{s['action'].upper()}] {s['file']} - {s['reason']}\")\n\n    # Step 3: Diff generation\n    echo(\"Step 3/5  Generating diffs (Sonnet)...\")\n    try:\n        diff_text = generate_diff(\n            query=query,\n            plan=steps,\n            compressed_context=context,\n            known_functions=known_fns,\n            missing_functions=missing_fns,\n            project_root=project_root,\n        )\n    except RuntimeError as exc:\n        echo(f\"  Diff generation failed: {exc}\", err=True)\n        return 1\n\n    diffs = parse_diff(diff_text)\n    if not diffs:\n        echo(\"  No diffs produced by LLM.\", err=True)\n        return 1\n\n    echo(f\"  {len(diffs)} file diff(s) parsed.\")\n\n    # Step 4: Validation\n    echo(\"Step 4/5  Validating diffs...\")\n    valid = True\n    patch_ops: list[tuple] = []  # (FileDiff, Path, str, str)\n\n    for diff in diffs:\n        original = \"\"\n        patched = \"\"\n        target = project_root / diff.relative_path\n        try:\n            target, original, patched = apply_file_diff(diff, project_root)\n        except FileNotFoundError as exc:\n            if diff.is_new_file:\n                target = project_root / diff.relative_path\n                original = \"\"\n                patched = _extract_create_content(diff.hunks)\n            else:\n                echo(f\"  ERROR: {exc}\", err=True)\n                valid = False\n                continue\n\n        vr = validate_patch(original, patched, diff.relative_path)\n        if not vr.ok:\n            echo(f\"  SYNTAX ERROR in {diff.relative_path}:\", err=True)\n            for err in vr.errors:\n                echo(f\"    {err}\", err=True)\n            valid = False\n            continue\n\n        if original:\n            vdup = validate_no_duplicates(original, patched[len(original):] if len(patched) > len(original) else \"\")\n            if not vdup.ok:\n                echo(f\"  DUPLICATE SYMBOL in {diff.relative_path}:\", err=True)\n                for err in vdup.errors:\n                    echo(f\"    {err}\", err=True)\n                valid = False\n                continue\n\n        echo(f\"  OK  {diff.relative_path}\")\n        patch_ops.append((diff, target, original, patched))\n\n    if not valid:\n        echo(\"Validation failed - no files written.\", err=True)\n        return 1\n\n    # Dry-run: show diffs only\n    if dry_run:\n        echo(\"\\n-- DRY RUN: diff preview --\")\n        echo(diff_text)\n        echo(\"-- No files written (--dry-run) --\")\n        return 0\n\n    # Step 5: Apply\n    if not yes:\n        files_list = \", \".join(str(t) for _, t, _, _ in patch_ops)\n        confirmed = confirm(f\"\\nApply changes to: {files_list}?\")\n        if not confirmed:\n            echo(\"Aborted.\")\n            return 0\n\n    echo(\"Step 5/5  Applying changes...\")\n    for _diff, target, original, patched in patch_ops:\n        if original:\n            bak = backup_file(target, backup_dir)\n            echo(f\"  Backed up {target.name} -> {bak.name}\")\n        target.parent.mkdir(parents=True, exist_ok=True)\n        target.write_text(patched, encoding=\"utf-8\")\n        action = \"Created\" if not original else \"Updated\"\n        echo(f\"  {action} {target}\")\n\n    echo(f\"\\nDone. {len(patch_ops)} file(s) modified. Backups in {backup_dir}\")\n    return 0"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
@@ -194,6 +194,56 @@
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py",
       "line": 223,
       "code": "def _name_to_ids_local(file_id: str, name: str, name_to_ids: dict[str, list[str]]) -> list[str]:\n    return [nid for nid in name_to_ids.get(name, []) if nid.startswith(file_id + \":\")]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/__init__.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_load_graph",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "line": 23,
+      "code": "def _load_graph() -> dict | None:\n    if not _GRAPH_PATH.exists():\n        return None\n    try:\n        return json.loads(_GRAPH_PATH.read_text(encoding=\"utf-8\"))\n    except Exception:\n        return None"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_sig",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "line": 32,
+      "code": "def _sig(code: str) -> str:\n    for line in code.splitlines():\n        s = line.strip()\n        if s.startswith((\"def \", \"async def \")):\n            return s.rstrip(\":\")\n    return \"\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_body",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "line": 40,
+      "code": "def _body(code: str) -> list[str]:\n    \"\"\"Return non-empty, non-comment body lines with docstrings stripped.\"\"\"\n    lines = code.splitlines()\n\n    # Find and skip the signature line\n    sig_idx = 0\n    for i, line in enumerate(lines):\n        s = line.strip()\n        if s.startswith((\"def \", \"async def \")):\n            sig_idx = i\n            break\n\n    body = lines[sig_idx + 1:]\n\n    # Strip leading docstring (handles single-line and multi-line)\n    i = 0\n    while i < len(body) and not body[i].strip():\n        i += 1\n    if i < len(body):\n        first = body[i].strip()\n        if first.startswith(('\"\"\"', \"'''\")):\n            marker = first[:3]\n            # Single-line docstring\n            if first.count(marker) >= 2 and len(first) > 3:\n                i += 1\n            else:\n                i += 1\n                while i < len(body) and marker not in body[i]:\n                    i += 1\n                i += 1\n        body = body[i:]\n\n    return [\n        l for l in body\n        if l.strip() and not l.strip().startswith(\"#\")\n    ]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_format_node",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "line": 78,
+      "code": "def _format_node(node: dict, budget_chars: int) -> tuple[str, int]:\n    \"\"\"Return formatted node block and chars consumed.\"\"\"\n    fname = node.get(\"file\", \"\").replace(\"\\\\\", \"/\").split(\"/\")[-1]\n    code = node.get(\"code\", \"\")\n\n    signature = _sig(code) or node.get(\"name\", \"?\")\n    body_lines = _body(code)\n\n    # Truncate body to fit budget\n    snippet = body_lines[:_BODY_LINES]\n    if len(body_lines) > _BODY_LINES:\n        snippet.append(\"    ...\")\n\n    block = f\"[{fname}]\\n{signature}\\n\" + \"\\n\".join(snippet)\n    if len(block) > budget_chars:\n        block = block[:budget_chars].rsplit(\"\\n\", 1)[0] + \"\\n    ...\"\n\n    return block, len(block)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_build_context",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "line": 98,
+      "code": "def _build_context(nodes: list[dict]) -> str:\n    blocks: list[str] = []\n    remaining = _TOKEN_BUDGET * 4  # chars\n\n    for node in nodes[:_MAX_NODES]:\n        if remaining <= 0:\n            break\n        block, used = _format_node(node, remaining)\n        blocks.append(block)\n        remaining -= used + 1  # +1 for separator\n\n    return \"\\n\\n\".join(blocks)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:main",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "line": 112,
+      "code": "def main() -> None:\n    try:\n        payload = json.loads(sys.stdin.read())\n    except Exception:\n        sys.exit(0)\n\n    query: str = payload.get(\"prompt\", \"\").strip()\n    if not query:\n        sys.exit(0)\n\n    graph = _load_graph()\n    if not graph:\n        sys.exit(0)\n\n    try:\n        result = run_query(query, graph)\n        selected: list[str] = result.get(\"nodes_selected\", [])\n        all_ids = [n[\"id\"] for n in graph.get(\"nodes\", []) if \"id\" in n]\n        pool_ids = selected if selected else all_ids\n\n        node_dicts = resolve_nodes(pool_ids, graph)\n        ranked = rank_and_select(node_dicts, query, top_n=_MAX_NODES)\n    except Exception:\n        sys.exit(0)\n\n    if not ranked:\n        sys.exit(0)\n\n    context = _build_context(ranked)\n    if context.strip():\n        sys.stdout.write(json.dumps({\"additionalContext\": context}))\n\n    sys.exit(0)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
@@ -403,6 +453,24 @@
       "code": "def format_intent_output(\n    result: Mapping[str, Any],\n    graph: Mapping[str, Any],\n) -> str:\n    \"\"\"Produce intent-aware CLI output for a query result.\n\n    Dispatches to one of four formatters:\n\n    * ``debug``    \u2192 CALL FLOW + POTENTIAL FAILURES + DEBUG HINTS + code\n    * ``explain``  \u2192 numbered FLOW + code\n    * ``generate`` \u2192 EXISTING COMPONENTS + SUGGESTED IMPLEMENTATION + code\n    * ``lookup``   \u2192 entry points + stats + code  (current behaviour)\n    \"\"\"\n    intent = result.get(\"intent\", \"lookup\")\n    node_map: dict[str, Any] = {n[\"id\"]: n for n in graph.get(\"nodes\", [])}\n    graph_nodes: list[Node] = list(node_map.values())\n    kept: list[Node] = [\n        node_map[nid]\n        for nid in result.get(\"nodes_selected\", [])\n        if nid in node_map\n    ]\n    edges: list[Edge] = graph.get(\"edges\", [])\n    entry_ids: list[str] = result.get(\"entry_points\", [])\n\n    flow = build_flow(kept, edges, entry_ids)\n    failures = extract_failures(kept)\n\n    if intent == \"debug\":\n        return _format_debug(result, flow, failures)\n    if intent == \"explain\":\n        return _format_explain(result, flow)\n    if intent == \"generate\":\n        return _format_generate(result, kept, graph_nodes)\n    return _format_lookup(result)"
     },
     {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:_load_graph",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py",
+      "line": 20,
+      "code": "def _load_graph() -> dict | None:\n    global _graph_cache\n    if _graph_cache is not None:\n        return _graph_cache\n    if not _GRAPH_PATH.exists():\n        return None\n    _graph_cache = json.loads(_GRAPH_PATH.read_text(encoding=\"utf-8\"))\n    return _graph_cache"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:get_context",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py",
+      "line": 31,
+      "code": "def get_context(query: str) -> str:\n    \"\"\"Minimal codebase context for the given query. Deterministic, no LLM.\"\"\"\n    graph = _load_graph()\n    if graph is None:\n        return \"ERROR: INDEX_NOT_FOUND\"\n\n    result = run_query(query, graph)\n    selected: list[str] = result.get(\"nodes_selected\", [])\n\n    # Fallback: expand to full graph when retrieval returns nothing\n    all_ids = [n[\"id\"] for n in graph.get(\"nodes\", []) if \"id\" in n]\n    pool_ids = selected if selected else all_ids\n    node_dicts = resolve_nodes(pool_ids, graph)\n    nodes = rank_and_select(node_dicts, query)\n    if not nodes:\n        return \"NO_CONTEXT_FOUND\"\n\n    return format_output(query, nodes)"
+    },
+    {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
       "type": "file"
     },
@@ -562,6 +630,121 @@
       "code": "def plan(query: str, context: str) -> list[dict]:\n    \"\"\"\n    Call Anthropic Haiku to generate a step-by-step plan.\n    Returns a list of {'file', 'action', 'reason'} dicts.\n    Raises RuntimeError if the anthropic package is missing or the response is malformed.\n    \"\"\"\n    try:\n        import anthropic\n    except ImportError as exc:\n        raise RuntimeError(\"anthropic package required: pip install anthropic>=0.40\") from exc\n\n    client = anthropic.Anthropic()\n\n    user_prompt = f\"\"\"TASK: {query}\n\nCODEBASE CONTEXT:\n{context}\n\nOutput the JSON plan now.\"\"\"\n\n    message = client.messages.create(\n        model=\"claude-haiku-4-5-20251001\",\n        max_tokens=1024,\n        system=_PLAN_SYSTEM,\n        messages=[{\"role\": \"user\", \"content\": user_prompt}],\n    )\n\n    raw = message.content[0].text.strip()\n\n    # Strip markdown fences if present\n    raw = re.sub(r\"^```[^\\n]*\\n\", \"\", raw, flags=re.MULTILINE)\n    raw = re.sub(r\"^```\\s*$\", \"\", raw, flags=re.MULTILINE)\n    raw = raw.strip()\n\n    try:\n        steps = json.loads(raw)\n    except json.JSONDecodeError as exc:\n        raise RuntimeError(f\"Planner returned invalid JSON: {exc}\\n\\nRaw response:\\n{raw}\") from exc\n\n    if not isinstance(steps, list):\n        raise RuntimeError(f\"Planner returned non-list JSON: {type(steps)}\")\n\n    validated: list[dict] = []\n    for i, step in enumerate(steps):\n        if not isinstance(step, dict):\n            continue\n        if \"file\" not in step or \"action\" not in step:\n            continue\n        validated.append({\n            \"file\": step[\"file\"],\n            \"action\": step.get(\"action\", \"modify\"),\n            \"reason\": step.get(\"reason\", \"\"),\n        })\n\n    if not validated:\n        raise RuntimeError(\"Planner returned zero valid steps.\")\n\n    return validated"
     },
     {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 26,
+      "code": "def normalize_path(p: str) -> str:\n    return p.replace(\"\\\\\", \"/\").lower().strip()"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:basename",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 30,
+      "code": "def basename(p: str) -> str:\n    return normalize_path(p).split(\"/\")[-1]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:paths_match",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 34,
+      "code": "def paths_match(a: str, b: str) -> bool:\n    na, nb = normalize_path(a), normalize_path(b)\n    return na == nb or basename(na) == basename(nb)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:extract_need",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 43,
+      "code": "def extract_need(text: str) -> tuple[str, str] | None:\n    \"\"\"Return (normalized_filename, reason) or None.\"\"\"\n    m = _NEED_PATTERN.search(text)\n    if not m:\n        return None\n    filename = normalize_path(m.group(1).strip().split()[0])\n    reason = m.group(2).strip()\n    return filename, reason"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:compute_confidence",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 57,
+      "code": "def compute_confidence(ranked_nodes: list[dict]) -> tuple[float, str]:\n    \"\"\"\n    Return (confidence 0.0\u20131.0, mode).\n    Inputs: coverage (endpoint/auth/helper present), file diversity, score gap.\n    \"\"\"\n    if not ranked_nodes:\n        return 0.0, \"open\"\n\n    from .ranker import _is_endpoint, _is_auth_fn, _is_helper\n\n    has_endpoint = any(_is_endpoint(n) for n in ranked_nodes)\n    has_auth = any(_is_auth_fn(n) for n in ranked_nodes)\n    has_helper = any(_is_helper(n) for n in ranked_nodes)\n    files = {n.get(\"file\", \"\") for n in ranked_nodes}\n    diverse = len(files) > 1\n\n    score = 0.0\n    score += 0.35 if has_endpoint else 0.0\n    score += 0.30 if has_auth else 0.0\n    score += 0.20 if has_helper else 0.0\n    score += 0.15 if diverse else 0.0\n\n    if score > 0.8:\n        mode = \"restricted\"\n    elif score > 0.5:\n        mode = \"guided\"\n    else:\n        mode = \"open\"\n\n    return round(score, 3), mode"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:get_related_files",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 93,
+      "code": "def get_related_files(filepath: str, max_extra: int = 3) -> set[str]:\n    \"\"\"Return files in the same directory (up to max_extra).\"\"\"\n    p = Path(filepath)\n    if not p.parent.exists():\n        return set()\n    siblings = [\n        str(f)\n        for f in p.parent.iterdir()\n        if f.suffix == \".py\" and f != p and not f.name.startswith(\"__\")\n    ]\n    return set(siblings[:max_extra])"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 176,
+      "code": "def gate(session: PolicySession, filepath: str, last_message: str) -> tuple[str, str]:\n    \"\"\"\n    Apply two-phase gate.\n    Returns (\"allow\", \"\") or (\"block\", reason_message).\n    \"\"\"\n    norm = normalize_path(filepath)\n\n    if session.mode == \"open\":\n        return \"allow\", \"\"\n\n    if session.is_allowed(filepath):\n        return \"allow\", \"\"\n\n    attempts = session.escape_attempts.get(norm, 0)\n\n    if attempts >= _MAX_ESCAPE_ATTEMPTS:\n        return \"block\", f\"Max escape attempts reached for {basename(norm)}.\"\n\n    parsed = extract_need(last_message)\n    if parsed and paths_match(parsed[0], filepath):\n        _, reason = parsed\n        session.record_escape(filepath, reason)\n        session.allow_with_neighbors(filepath)\n        session.save()\n        return \"allow\", \"\"\n\n    if attempts == 0:\n        session.record_deny(filepath)\n        session.save()\n        return (\n            \"block\",\n            f\"File outside scope: {basename(norm)}. \"\n            f\"If required, respond with:\\n\"\n            f\"NEED: {basename(norm)}\\n\"\n            f\"REASON: <one sentence explaining why>\",\n        )\n\n    session.record_deny(filepath)\n    session.save()\n    return \"block\", f\"Invalid NEED/REASON for {basename(norm)}. Access denied.\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 111
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.load",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 124,
+      "code": "def load(cls) -> \"PolicySession\":\n        if _SESSION_FILE.exists():\n            try:\n                data = json.loads(_SESSION_FILE.read_text(encoding=\"utf-8\"))\n                return cls(**data)\n            except Exception:\n                pass\n        return cls()"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.save",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 133,
+      "code": "def save(self) -> None:\n        _SESSION_DIR.mkdir(exist_ok=True)\n        _SESSION_FILE.write_text(\n            json.dumps(self.__dict__, indent=2), encoding=\"utf-8\"\n        )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.save_log",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 139,
+      "code": "def save_log(self) -> None:\n        _LOG_DIR.mkdir(parents=True, exist_ok=True)\n        log_path = _LOG_DIR / f\"{self.session_id}.json\"\n        log_path.write_text(\n            json.dumps(self.__dict__, indent=2), encoding=\"utf-8\"\n        )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.is_allowed",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 148,
+      "code": "def is_allowed(self, filepath: str) -> bool:\n        return any(paths_match(filepath, f) for f in self.allowed_files)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_file",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 151,
+      "code": "def allow_file(self, filepath: str) -> None:\n        norm = normalize_path(filepath)\n        if not self.is_allowed(norm):\n            self.allowed_files.append(norm)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_with_neighbors",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 156,
+      "code": "def allow_with_neighbors(self, filepath: str) -> None:\n        self.allow_file(filepath)\n        for neighbor in get_related_files(filepath):\n            self.allow_file(neighbor)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.record_deny",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 161,
+      "code": "def record_deny(self, filepath: str) -> None:\n        norm = normalize_path(filepath)\n        self.denied_reads.append(norm)\n        self.escape_attempts[norm] = self.escape_attempts.get(norm, 0) + 1"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.record_escape",
+      "type": "method",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "line": 166,
+      "code": "def record_escape(self, filepath: str, reason: str) -> None:\n        norm = normalize_path(filepath)\n        attempt = self.escape_attempts.get(norm, 0)\n        self.escapes.append({\"file\": norm, \"reason\": reason, \"attempt\": attempt})"
+    },
+    {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/pruner.py",
       "type": "file"
     },
@@ -673,81 +856,137 @@
       "type": "file"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_keyword_score",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_test_file",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 36,
-      "code": "def _keyword_score(node: dict, query_tokens: set[str]) -> float:\n    name_tokens = set(re.split(r\"[_\\W]+\", node.get(\"name\", \"\").lower()))\n    file_tokens = set(re.split(r\"[/_\\W]+\", node.get(\"file\", \"\").lower()))\n    code = node.get(\"code\", \"\").lower()\n    hits = len(query_tokens & name_tokens) * 3\n    hits += len(query_tokens & file_tokens) * 1\n    hits += sum(1 for t in query_tokens if t in code)\n    return float(hits)"
+      "line": 32,
+      "code": "def _is_test_file(fpath: str) -> bool:\n    p = fpath.replace(\"\\\\\", \"/\").lower()\n    name = p.split(\"/\")[-1]\n    return name.startswith(\"test_\") or name.endswith(\"_test.py\") or \"/test\" in p or \"/tests/\" in p"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_centrality_score",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_enrich",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 38,
+      "code": "def _enrich(nid: str, raw: dict, calls_map: dict, callers_map: dict) -> dict:\n    node = dict(raw)\n    node[\"name\"] = nid.split(\":\")[-1]\n    node[\"calls\"] = [dst.split(\":\")[-1] for dst in calls_map.get(nid, [])]\n    node[\"callers\"] = [src.split(\":\")[-1] for src in callers_map.get(nid, [])]\n    return node"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:resolve_nodes",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
       "line": 46,
-      "code": "def _centrality_score(node: dict) -> float:\n    calls = len(node.get(\"calls\", []))\n    callers = len(node.get(\"callers\", []))\n    return min(calls + callers * 1.5, 10.0)"
+      "code": "def resolve_nodes(selected_ids: list[str], graph: dict) -> list[dict]:\n    \"\"\"\n    Resolve node IDs to enriched dicts. When test-file nodes are in the pool,\n    automatically pulls in the implementation nodes they call.\n    \"\"\"\n    by_id: dict[str, dict] = {n[\"id\"]: dict(n) for n in graph.get(\"nodes\", []) if \"id\" in n}\n\n    # Track full destination IDs (not just names) to enable cross-file expansion\n    calls_map: dict[str, list[str]] = {}   # src_id -> [dst_id, ...]\n    callers_map: dict[str, list[str]] = {} # dst_id -> [src_id, ...]\n    for edge in graph.get(\"edges\", []):\n        if edge.get(\"type\") == \"calls\":\n            src, dst = edge[\"from\"], edge[\"to\"]\n            calls_map.setdefault(src, []).append(dst)\n            callers_map.setdefault(dst, []).append(src)\n\n    resolved: dict[str, dict] = {}\n    for nid in selected_ids:\n        raw = by_id.get(nid)\n        if not raw:\n            continue\n        resolved[nid] = _enrich(nid, raw, calls_map, callers_map)\n\n    # For test-file nodes: follow calls into implementation files\n    impl_ids: list[str] = []\n    for nid, node in list(resolved.items()):\n        if not _is_test_file(node.get(\"file\", \"\")):\n            continue\n        for dst_id in calls_map.get(nid, []):\n            if dst_id not in resolved and not _is_test_file(by_id.get(dst_id, {}).get(\"file\", \"\")):\n                impl_ids.append(dst_id)\n\n    for nid in impl_ids:\n        raw = by_id.get(nid)\n        if raw:\n            resolved[nid] = _enrich(nid, raw, calls_map, callers_map)\n\n    # Narrowness fallback: if all nodes share one file, add their callees\n    files = {n.get(\"file\") for n in resolved.values()}\n    if len(files) == 1:\n        extra_ids = []\n        for nid, node in list(resolved.items()):\n            for dst_id in calls_map.get(nid, []):\n                if dst_id not in resolved and by_id.get(dst_id, {}).get(\"type\") in (\"function\", \"method\"):\n                    extra_ids.append(dst_id)\n                    if len(extra_ids) >= 4:\n                        break\n            if len(extra_ids) >= 4:\n                break\n        for nid in extra_ids:\n            raw = by_id.get(nid)\n            if raw:\n                resolved[nid] = _enrich(nid, raw, calls_map, callers_map)\n\n    return list(resolved.values())"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_file_score",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_tokens",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 52,
-      "code": "def _file_score(node: dict) -> float:\n    fpath = node.get(\"file\", \"\").lower()\n    score = 0.0\n    for keyword, weight in _FILE_IMPORTANCE.items():\n        if keyword in fpath:\n            score += weight\n    return score"
+      "line": 103,
+      "code": "def _tokens(text: str) -> set[str]:\n    return set(re.split(r\"[_\\W]+\", text.lower())) - _STOPWORDS - {\"\"}"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_alias_tokens",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 61,
-      "code": "def rank_nodes(nodes: list[dict], query: str) -> list[dict]:\n    query_tokens = set(re.split(r\"\\W+\", query.lower())) - {\"\", \"a\", \"the\", \"in\", \"to\", \"for\"}\n    scored = []\n    for node in nodes:\n        score = (\n            _keyword_score(node, query_tokens) * 2.0\n            + _centrality_score(node) * 0.8\n            + _file_score(node) * 1.2\n        )\n        scored.append((score, node))\n    scored.sort(key=lambda x: x[0], reverse=True)\n    return [n for _, n in scored[:8]]"
+      "line": 107,
+      "code": "def _alias_tokens(query_tokens: set[str]) -> set[str]:\n    expanded = set(query_tokens)\n    for t in query_tokens:\n        expanded |= _ALIASES.get(t, set())\n    return expanded"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_args",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_short_path",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 75,
-      "code": "def _extract_args(code: str, name: str) -> str:\n    try:\n        tree = ast.parse(code)\n        for node in ast.walk(tree):\n            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:\n                args = [a.arg for a in node.args.args if a.arg != \"self\"]\n                defaults_offset = len(args) - len(node.args.defaults)\n                parts = []\n                for i, arg in enumerate(args):\n                    di = i - defaults_offset\n                    if di >= 0:\n                        parts.append(f\"{arg}=...\")\n                    else:\n                        parts.append(arg)\n                return \", \".join(parts)\n    except SyntaxError:\n        pass\n    m = re.search(rf\"def\\s+{re.escape(name)}\\s*\\(([^)]*)\\)\", code)\n    if m:\n        raw = m.group(1).replace(\"\\n\", \" \").strip()\n        args = [a.strip().split(\":\")[0].strip() for a in raw.split(\",\") if a.strip() and a.strip() != \"self\"]\n        return \", \".join(args)\n    return \"\""
+      "line": 114,
+      "code": "def _short_path(fpath: str) -> str:\n    parts = fpath.replace(\"\\\\\", \"/\").split(\"/\")\n    return parts[-1] if parts else fpath"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_infer_purpose",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_docstring",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 100,
-      "code": "def _infer_purpose(name: str, node_type: str) -> str:\n    tokens = re.split(r\"[_\\W]+\", name.lower())\n    for token in tokens:\n        if token in _PURPOSE_VERBS:\n            rest = [t for t in tokens if t != token]\n            subject = \"_\".join(rest) if rest else \"resource\"\n            return f\"{_PURPOSE_VERBS[token]} {subject}\"\n    if node_type == \"class\":\n        return \"data model / service class\"\n    return \"utility\""
+      "line": 119,
+      "code": "def _extract_docstring(code: str) -> str:\n    \"\"\"Return first docstring text from a function, or empty string.\"\"\"\n    try:\n        tree = ast.parse(code)\n        for node in ast.walk(tree):\n            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):\n                if (\n                    node.body\n                    and isinstance(node.body[0], ast.Expr)\n                    and isinstance(node.body[0].value, ast.Constant)\n                    and isinstance(node.body[0].value.value, str)\n                ):\n                    return node.body[0].value.value.lower()\n    except SyntaxError:\n        pass\n    return \"\""
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_endpoint_relevance",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 112,
-      "code": "def summarize_node(node: dict) -> str:\n    name = node.get(\"name\", \"unknown\")\n    ntype = node.get(\"type\", \"function\")\n    code = node.get(\"code\", \"\")\n    fpath = node.get(\"file\", \"\")\n    short_path = \"/\".join(fpath.replace(\"\\\\\", \"/\").split(\"/\")[-2:]) if fpath else \"\"\n\n    if ntype == \"class\":\n        purpose = _infer_purpose(name, \"class\")\n        return f\"{name} [{short_path}] -> {purpose}\"\n\n    args = _extract_args(code, name)\n    purpose = _infer_purpose(name, \"function\")\n    prefix = \"async \" if re.search(r\"^\\s*async def\", code, re.MULTILINE) else \"\"\n    return f\"{prefix}{name}({args}) [{short_path}] -> {purpose}\""
+      "line": 137,
+      "code": "def _endpoint_relevance(node: dict, alias_tokens: set[str]) -> int:\n    \"\"\"Extra score when an endpoint's route path matches query intent.\"\"\"\n    code = node.get(\"code\", \"\").lower()\n    # Find route path strings in decorator args\n    paths = re.findall(r'[\"\\'](/[^\"\\']*)[\"\\']', code)\n    for path in paths:\n        if any(t in path for t in alias_tokens if len(t) >= 3):\n            return 2\n    return 0"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:build_flow",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_score",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 129,
-      "code": "def build_flow(nodes: list[dict]) -> str:\n    if not nodes:\n        return \"(no flow detected)\"\n\n    name_set = {n.get(\"name\") for n in nodes}\n    graph: dict[str, list[str]] = {\n        n[\"name\"]: [c for c in n.get(\"calls\", []) if c in name_set and c is not None]\n        for n in nodes if n.get(\"name\")\n    }\n\n    # Find root: node with no callers within the set\n    caller_targets = {c for targets in graph.values() for c in targets}\n    roots = [n for n in graph if n not in caller_targets]\n    start = roots[0] if roots else next(iter(graph), None)\n\n    if not start:\n        return \" -> \".join(n.get(\"name\", \"?\") for n in nodes[:4])\n\n    chain: list[str] = []\n    visited: set[str] = set()\n    current: str | None = start\n    while current and current not in visited and len(chain) < 4:\n        chain.append(current)\n        visited.add(current)\n        nxt = graph.get(current, [])\n        current = nxt[0] if nxt else None\n\n    return \" -> \".join(chain) if chain else start"
+      "line": 148,
+      "code": "def _score(node: dict, query_tokens: set[str], alias_tokens: set[str]) -> int:\n    if node.get(\"type\") not in (\"function\", \"method\"):\n        return 0\n    name = node.get(\"name\", \"\").lower()\n    fpath = node.get(\"file\", \"\").lower()\n    code = node.get(\"code\", \"\").lower()\n    name_tokens = _tokens(name)\n    docstring = _extract_docstring(node.get(\"code\", \"\"))\n\n    score = 0\n    # Exact / full token match\n    if name in query_tokens or name_tokens == query_tokens:\n        score += 3\n    # Token overlap on name\n    score += len(query_tokens & name_tokens) * 2\n    # Alias token overlap on name\n    score += len((alias_tokens - query_tokens) & name_tokens)\n    # Substring: any alias token appears inside function name\n    for t in alias_tokens:\n        if len(t) >= 3 and t in name:\n            score += 1\n    # Endpoint: base boost + intent-matched route path\n    if _is_endpoint(node):\n        score += 2 + _endpoint_relevance(node, alias_tokens)\n    # File path: query OR alias token in path\n    if any(k in fpath for k in alias_tokens):\n        score += 2\n    # Auth-module priority boost\n    if any(k in fpath for k in _AUTH_MODULE_KEYWORDS):\n        score += 1\n    # Docstring match against alias tokens\n    for t in alias_tokens:\n        if len(t) >= 4 and t in docstring:\n            score += 1\n            break\n    # Body match: alias tokens in code (covers \"/token\" endpoints, string literals)\n    body_hits = sum(1 for t in alias_tokens if len(t) >= 4 and t in code)\n    score += min(body_hits, 2)\n    return score"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_constraints",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_strip_comments",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 159,
-      "code": "def _detect_constraints(nodes: list[dict]) -> list[str]:\n    combined = \" \".join(n.get(\"code\", \"\") for n in nodes)\n    found = []\n    for label, signals in _FRAMEWORK_SIGNALS.items():\n        if any(sig in combined for sig in signals):\n            found.append(label)\n    return found"
+      "line": 189,
+      "code": "def _strip_comments(code: str) -> str:\n    lines = []\n    for line in code.splitlines():\n        cleaned = re.sub(r'\\s*#.*$', \"\", line).rstrip()\n        if cleaned.strip():\n            lines.append(cleaned)\n    return \"\\n\".join(lines)"
     },
     {
-      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_missing",
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_strip_docstrings",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 168,
-      "code": "def _detect_missing(nodes: list[dict]) -> list[str]:\n    defined = {n.get(\"name\") for n in nodes}\n    missing = set()\n    for node in nodes:\n        for call in node.get(\"calls\", []):\n            if call and call not in defined:\n                missing.add(call)\n    return sorted(missing)[:6]"
+      "line": 198,
+      "code": "def _strip_docstrings(code: str) -> str:\n    try:\n        tree = ast.parse(code)\n    except SyntaxError:\n        return code\n    for node in ast.walk(tree):\n        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):\n            if (\n                node.body\n                and isinstance(node.body[0], ast.Expr)\n                and isinstance(node.body[0].value, ast.Constant)\n                and isinstance(node.body[0].value.value, str)\n            ):\n                node.body.pop(0)\n    return code"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_compress",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 215,
+      "code": "def _compress(code: str, max_lines: int = 18) -> str:\n    code = _strip_docstrings(code)\n    code = _strip_comments(code)\n    lines = [l for l in code.splitlines() if l.strip()]\n    if len(lines) > max_lines:\n        lines = lines[:max_lines] + [\"    ...\"]\n    return \"\\n\".join(lines)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_endpoint",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 235,
+      "code": "def _is_endpoint(node: dict) -> bool:\n    code = node.get(\"code\", \"\")\n    return bool(_ENDPOINT_PATTERNS.search(code))"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_auth_fn",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 240,
+      "code": "def _is_auth_fn(node: dict) -> bool:\n    name_tokens = _tokens(node.get(\"name\", \"\"))\n    return bool(name_tokens & _AUTH_VERBS)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_helper",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 245,
+      "code": "def _is_helper(node: dict) -> bool:\n    name = node.get(\"name\", \"\")\n    return name.startswith(\"_\") or any(\n        t in name.lower() for t in (\"helper\", \"util\", \"get_\", \"fetch_\", \"build_\", \"make_\")\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_coverage_select",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 252,
+      "code": "def _coverage_select(scored: list[tuple[int, dict]], top_n: int) -> list[dict]:\n    \"\"\"\n    Coverage-aware selection: guarantee at least one endpoint, one auth function,\n    one helper/dependency. Fill remaining slots with top-scored diverse nodes.\n    Max 2 nodes per file.\n    \"\"\"\n    slots: dict[str, dict | None] = {\"endpoint\": None, \"auth\": None, \"helper\": None}\n    remaining: list[tuple[int, dict]] = []\n\n    for s, node in scored:\n        if slots[\"endpoint\"] is None and _is_endpoint(node):\n            slots[\"endpoint\"] = node\n        elif slots[\"auth\"] is None and _is_auth_fn(node):\n            slots[\"auth\"] = node\n        elif slots[\"helper\"] is None and _is_helper(node):\n            slots[\"helper\"] = node\n        else:\n            remaining.append((s, node))\n\n    selected: list[dict] = [n for n in slots.values() if n is not None]\n    seen_names = {n.get(\"name\") for n in selected}\n    file_counts: dict[str, int] = {}\n    for n in selected:\n        f = n.get(\"file\", \"\")\n        file_counts[f] = file_counts.get(f, 0) + 1\n\n    for _, node in remaining:\n        if len(selected) >= top_n:\n            break\n        name = node.get(\"name\")\n        f = node.get(\"file\", \"\")\n        if name in seen_names:\n            continue\n        if file_counts.get(f, 0) >= 2:\n            continue\n        selected.append(node)\n        seen_names.add(name)\n        file_counts[f] = file_counts.get(f, 0) + 1\n\n    return selected"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_fallback_select",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 294,
+      "code": "def _fallback_select(nodes: list[dict], top_n: int) -> list[dict]:\n    fn_nodes = [n for n in nodes if n.get(\"type\") in (\"function\", \"method\")]\n    ranked = sorted(\n        fn_nodes,\n        key=lambda n: len(n.get(\"calls\", [])) + len(n.get(\"callers\", [])),\n        reverse=True,\n    )\n    # Apply file diversity even in fallback\n    seen_files: dict[str, int] = {}\n    result = []\n    for n in ranked:\n        f = n.get(\"file\", \"\")\n        if seen_files.get(f, 0) < 2:\n            result.append(n)\n            seen_files[f] = seen_files.get(f, 0) + 1\n        if len(result) >= top_n:\n            break\n    return result"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "line": 314,
+      "code": "def rank_and_select(nodes: list[dict], query: str, top_n: int = 4) -> list[dict]:\n    query_tokens = _tokens(query)\n    alias_tokens = _alias_tokens(query_tokens)\n\n    scored: list[tuple[int, dict]] = []\n    for node in nodes:\n        s = _score(node, query_tokens, alias_tokens)\n        if s == 0:\n            continue\n        scored.append((s, node))\n    scored.sort(key=lambda x: x[0], reverse=True)\n\n    if not scored:\n        return _fallback_select(nodes, top_n)\n\n    # Expand pool by 1-hop before coverage selection\n    top_names = {n.get(\"name\") for _, n in scored[:top_n]}\n    by_name = {n.get(\"name\"): n for n in nodes if n.get(\"name\")}\n    additions: list[tuple[int, dict]] = []\n    caller_count = 0\n\n    for _, node in scored[:top_n]:\n        for callee in node.get(\"calls\", []):\n            if callee and callee not in top_names and callee in by_name:\n                s = _score(by_name[callee], query_tokens, alias_tokens)\n                if s >= 2:\n                    additions.append((s, by_name[callee]))\n                    top_names.add(callee)\n        for caller in node.get(\"callers\", []):\n            if caller_count >= 2:\n                break\n            if caller and caller not in top_names and caller in by_name:\n                s = _score(by_name[caller], query_tokens, alias_tokens)\n                if s >= 2:\n                    additions.append((s, by_name[caller]))\n                    top_names.add(caller)\n                    caller_count += 1\n\n    all_scored = sorted(scored + additions, key=lambda x: x[0], reverse=True)\n\n    # Dedup\n    seen: set[str] = set()\n    deduped: list[tuple[int, dict]] = []\n    for s, n in all_scored:\n        name = n.get(\"name\")\n        if name and name not in seen:\n            seen.add(name)\n            deduped.append((s, n))\n\n    return _coverage_select(deduped, top_n)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "line": 178,
-      "code": "def format_output(query: str, nodes: list[dict]) -> str:\n    ranked = rank_nodes(nodes, query)\n    flow = build_flow(ranked)\n    summaries = \"\\n\".join(summarize_node(n) for n in ranked)\n    missing = _detect_missing(ranked)\n    constraints = _detect_constraints(ranked)\n\n    missing_str = \", \".join(missing) if missing else \"none detected\"\n    constraints_str = \", \".join(constraints) if constraints else \"unknown\"\n\n    return (\n        f\"=== TASK ===\\n{query}\\n\\n\"\n        f\"=== CORE FLOW ===\\n{flow}\\n\\n\"\n        f\"=== KEY FUNCTIONS ===\\n{summaries}\\n\\n\"\n        f\"=== MISSING ===\\n{missing_str}\\n\\n\"\n        f\"=== CONSTRAINTS ===\\n{constraints_str}\"\n    )"
+      "line": 366,
+      "code": "def format_output(_query: str, nodes: list[dict]) -> str:\n    if not nodes:\n        return \"NO_CONTEXT_FOUND\"\n\n    by_file: dict[str, list[dict]] = {}\n    for node in nodes:\n        key = _short_path(node.get(\"file\", \"unknown\"))\n        by_file.setdefault(key, []).append(node)\n\n    blocks: list[str] = []\n    total = 0\n\n    for fname, fnodes in by_file.items():\n        blocks.append(f\"[{fname}]\")\n        for node in fnodes:\n            compressed = _compress(node.get(\"code\", \"\"))\n            lines = compressed.splitlines()\n            if total + len(lines) > 55:\n                remaining = 55 - total\n                if remaining <= 0:\n                    break\n                lines = lines[:remaining] + [\"    ...\"]\n            blocks.extend(lines)\n            blocks.append(\"\")\n            total += len(lines) + 1\n\n    return \"\\n\".join(l for l in blocks if l.strip()).strip()"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py",
@@ -949,6 +1188,39 @@
       "type": "class",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py",
       "line": 10
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/hooks/post_tool_use.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/hooks/post_tool_use.py:main",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/hooks/post_tool_use.py",
+      "line": 17,
+      "code": "def main() -> None:\n    raw = sys.stdin.read()\n    try:\n        payload = json.loads(raw)\n    except json.JSONDecodeError:\n        sys.exit(0)\n\n    tool_name: str = payload.get(\"tool_name\", \"\")\n    if tool_name not in _GATED_TOOLS:\n        sys.exit(0)\n\n    tool_input: dict = payload.get(\"tool_input\", {})\n    filepath = None\n    for key in (\"file_path\", \"path\", \"file\"):\n        val = tool_input.get(key)\n        if val and isinstance(val, str):\n            filepath = normalize_path(val)\n            break\n\n    if not filepath:\n        sys.exit(0)\n\n    session = PolicySession.load()\n\n    # Record successful read/edit for audit trail\n    entry = {\"tool\": tool_name, \"file\": filepath}\n    if not hasattr(session, \"_tool_uses\"):\n        session.__dict__.setdefault(\"_tool_uses\", [])\n    session.__dict__[\"_tool_uses\"].append(entry)\n\n    session.save()\n    session.save_log()\n    sys.exit(0)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/hooks/pre_tool_use.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:_load_graph",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py",
+      "line": 22,
+      "code": "def _load_graph() -> dict | None:\n    if not _GRAPH_PATH.exists():\n        return None\n    try:\n        return json.loads(_GRAPH_PATH.read_text(encoding=\"utf-8\"))\n    except Exception:\n        return None"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py",
+      "line": 31,
+      "code": "def main() -> None:\n    payload = json.loads(sys.stdin.read())\n    query: str = payload.get(\"prompt\", \"\")\n\n    graph = _load_graph()\n    if not graph or not query.strip():\n        sys.exit(0)\n\n    # Run retrieval\n    result = run_query(query, graph)\n    selected: list[str] = result.get(\"nodes_selected\", [])\n    all_ids = [n[\"id\"] for n in graph.get(\"nodes\", []) if \"id\" in n]\n    pool_ids = selected if selected else all_ids\n    node_dicts = resolve_nodes(pool_ids, graph)\n    ranked = rank_and_select(node_dicts, query)\n\n    # Build session\n    session = PolicySession()\n    session.query = query\n    session.confidence, session.mode = compute_confidence(ranked)\n\n    # Seed allowed files from ranked nodes\n    for node in ranked:\n        fpath = node.get(\"file\", \"\")\n        if fpath:\n            session.allow_file(fpath)\n\n    session.save()\n    session.save_log()\n\n    # Inject compressed context as system hint (stdout appended to prompt)\n    if ranked:\n        context = format_output(query, ranked)\n        out = {\n            \"prompt_suffix\": (\n                f\"\\n\\n<llm-diet-context>\\n{context}\\n</llm-diet-context>\\n\"\n                f\"<!-- mode={session.mode} confidence={session.confidence} \"\n                f\"files={[normalize_path(f).split('/')[-1] for f in session.allowed_files]} -->\"\n            )\n        }\n        sys.stdout.write(json.dumps(out))\n\n    sys.exit(0)"
     }
   ],
   "edges": [
@@ -971,6 +1243,16 @@
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:run_apply",
       "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_deterministic_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:resolve_nodes",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_deterministic_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "type": "calls"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/apply.py:_deterministic_context",
@@ -1268,6 +1550,76 @@
       "type": "calls"
     },
     {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_load_graph",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_sig",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_body",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_format_node",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_build_context",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:main",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_format_node",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_body",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_format_node",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_sig",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_build_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_format_node",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_load_graph",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:_build_context",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:resolve_nodes",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "type": "calls"
+    },
+    {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:detect_intent",
       "type": "contains"
@@ -1548,6 +1900,41 @@
       "type": "calls"
     },
     {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:_load_graph",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:get_context",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:get_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:_load_graph",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:get_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:get_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:resolve_nodes",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:get_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py:get_context",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "type": "calls"
+    },
+    {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:_get_snippet",
       "type": "contains"
@@ -1728,6 +2115,201 @@
       "type": "contains"
     },
     {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:basename",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:paths_match",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:extract_need",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:compute_confidence",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:get_related_files",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.load",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.save",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.save_log",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.is_allowed",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_file",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_with_neighbors",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.record_deny",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.record_escape",
+      "type": "has_method"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:basename",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:paths_match",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:paths_match",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:basename",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:extract_need",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:compute_confidence",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_endpoint",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:compute_confidence",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_auth_fn",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:compute_confidence",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_helper",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.is_allowed",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:extract_need",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.record_deny",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.save",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:paths_match",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.record_escape",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_with_neighbors",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:gate",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:basename",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.is_allowed",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:paths_match",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.is_allowed",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_with_neighbors",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_file",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.allow_with_neighbors",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:get_related_files",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.record_deny",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession.record_escape",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "calls"
+    },
+    {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/pruner.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/pruner.py:_parse_fn",
       "type": "contains"
@@ -1899,52 +2481,92 @@
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_keyword_score",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_test_file",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_centrality_score",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_enrich",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_file_score",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:resolve_nodes",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_tokens",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_args",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_alias_tokens",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_infer_purpose",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_short_path",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_docstring",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:build_flow",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_endpoint_relevance",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_constraints",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_score",
       "type": "contains"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_missing",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_strip_comments",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_strip_docstrings",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_compress",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_endpoint",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_auth_fn",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_helper",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_coverage_select",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_fallback_select",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
       "type": "contains"
     },
     {
@@ -1953,53 +2575,98 @@
       "type": "contains"
     },
     {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_file_score",
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:resolve_nodes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_enrich",
       "type": "calls"
     },
     {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_keyword_score",
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:resolve_nodes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_test_file",
       "type": "calls"
     },
     {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_centrality_score",
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_score",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_tokens",
       "type": "calls"
     },
     {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_args",
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_score",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_extract_docstring",
       "type": "calls"
     },
     {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_infer_purpose",
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_score",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_endpoint",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_score",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_endpoint_relevance",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_compress",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_strip_docstrings",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_compress",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_strip_comments",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_auth_fn",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_tokens",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_coverage_select",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_endpoint",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_coverage_select",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_auth_fn",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_coverage_select",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_is_helper",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_tokens",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_alias_tokens",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_coverage_select",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_score",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_fallback_select",
       "type": "calls"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_nodes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_short_path",
       "type": "calls"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:build_flow",
-      "type": "calls"
-    },
-    {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_missing",
-      "type": "calls"
-    },
-    {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_detect_constraints",
-      "type": "calls"
-    },
-    {
-      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
-      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:summarize_node",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:_compress",
       "type": "calls"
     },
     {
@@ -2325,6 +2992,66 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_patch",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/validator.py:validate_syntax",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/post_tool_use.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/hooks/post_tool_use.py:main",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/post_tool_use.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:_load_graph",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:_load_graph",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/retrieval.py:run_query",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:resolve_nodes",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:PolicySession",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:compute_confidence",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:format_output",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/hooks/user_prompt_submit.py:main",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/policy.py:normalize_path",
       "type": "calls"
     }
   ]

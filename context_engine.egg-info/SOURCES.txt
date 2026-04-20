@@ -10,6 +10,7 @@ context_engine/mcp_server.py
 context_engine/parser.py
 context_engine/patcher.py
 context_engine/planner.py
+context_engine/policy.py
 context_engine/pruner.py
 context_engine/ranker.py
 context_engine/retrieval.py
