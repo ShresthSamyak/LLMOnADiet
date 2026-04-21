@@ -51,7 +51,7 @@ No embeddings. No vector DB. No LLM calls in the retrieval path.
 ## Install
 
 ```bash
-pip install context-engine
+pip install llm-diet
 context-engine index .
 ```
 

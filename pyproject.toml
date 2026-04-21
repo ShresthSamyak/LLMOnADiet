@@ -3,9 +3,10 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "context-engine"
+name = "llm-diet"
 version = "0.1.0"
 description = "Deterministic codebase context retrieval for LLMs"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "typer>=0.12",
