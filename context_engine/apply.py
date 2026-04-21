@@ -126,7 +126,14 @@ def run_apply(
     Full apply pipeline: query → plan → diff → validate → apply.
     Returns exit code (0 = success, 1 = error).
     """
+    import os
     from typer import echo, confirm
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Error: ANTHROPIC_API_KEY environment variable not set.")
+        print("Get your key at https://console.anthropic.com/")
+        print("Then run: set ANTHROPIC_API_KEY=your-key-here")
+        return 1
 
     backup_dir = project_root / ".cecl" / "backups"
 

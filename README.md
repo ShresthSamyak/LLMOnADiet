@@ -17,7 +17,7 @@
 | fix error handling | 46,661 | 479 | 99.0% | 3 | intent.py, validator.py, patcher.py | 187 |
 | add logging to the pipeline | 46,661 | 58 | 99.9% | 1 | cli.py | 141 |
 
-**46,661 tokens → 275 tokens average. Same accuracy. 176ms overhead.**
+**46,661 tokens → 275 tokens average. Same accuracy. 176ms overhead (small repo).**
 
 ## Benchmark (external repo — fastapi, 946k token codebase)
 
@@ -76,16 +76,18 @@ context-engine apply "add input validation to the login endpoint"
 No LLM calls, no vector DB, no setup.
 
 context-engine uses AST parsing + call graph traversal. It's deterministic —
-same query, same graph, same result every time. Works offline. Runs in ~176ms.
+same query, same graph, same result every time. Works offline. Runs in ~176ms (small repo) / ~432ms (large repo like FastAPI).
 Embeddings need a model call just to retrieve context. We don't.
 
 | Feature | context-engine | code-review-graph |
 |---------|---------------|-------------------|
 | Languages | Python, JS, TS, JSX, TSX | 23 languages |
 | Dependencies | tree-sitter only | tree-sitter + SQLite + more |
-| Context injection | UserPromptSubmit hook | MCP server |
+| Context injection | UserPromptSubmit hook (Claude Code) / IDE rules (Cursor, Windsurf) | MCP server |
 | Autonomous apply | ✅ plan → diff → validate → patch | ❌ |
 | Setup | pip install + index | pip install + build |
 | Incremental updates | auto on file save via `context-engine watch` | auto on file save |
 
 We do less. What we do, we do surgically.
+
+\* Full token reduction applies to Claude Code. Cursor/Windsurf receive static rules files that guide the AI to prefer provided context — dynamic injection coming in a future release.
