@@ -10,6 +10,7 @@ import typer
 
 from .apply import run_apply
 from .graph_builder import build_graph
+from .installer import install as _install
 from .intent import format_intent_output
 from .js_parser import JS_EXTENSIONS, parse_js_file
 from .parser import parse_file
@@ -241,6 +242,33 @@ def watch(
     """Watch for file changes and auto-rebuild .cecl/graph.json."""
     _configure_logging(verbose)
     _watch(directory)
+
+
+@app.command()
+def install(
+    directory: Path = typer.Argument(
+        default=Path("."),
+        help="Project root to configure (default: current directory).",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
+) -> None:
+    """Auto-detect AI coding tools and write context-engine hook configs."""
+    results = _install(directory)
+
+    if not results:
+        typer.echo(
+            "No supported AI coding tools detected.\n"
+            "Expected one of: .claude/  .cursor/  .windsurf/\n"
+            "Create the directory for your tool and re-run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    for platform, config_path, status in results:
+        typer.echo(f"  {platform:<14}  {config_path}  ({status})")
 
 
 def main() -> None:

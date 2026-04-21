@@ -86,6 +86,6 @@ Embeddings need a model call just to retrieve context. We don't.
 | Context injection | UserPromptSubmit hook | MCP server |
 | Autonomous apply | ✅ plan → diff → validate → patch | ❌ |
 | Setup | pip install + index | pip install + build |
-| Incremental updates | manual re-index | auto on file save |
+| Incremental updates | auto on file save via `context-engine watch` | auto on file save |
 
 We do less. What we do, we do surgically.

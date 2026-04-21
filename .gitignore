@@ -1,12 +1,31 @@
-.claude
+# context-engine build/runtime artifacts
+.cecl/
+.llm_diet/
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
-.env
-.venv
-env/
+
+# virtual environments
+.venv/
 venv/
+env/
 ENV/
-env.bak/
-venv.bak/
+
+# packaging
+dist/
+*.egg-info/
+build/
+
+# secrets / local config
+.env
+
+# AI tool configs (project-local, not committed)
+.claude/
+.cursor/
+.windsurf/
+
+# temp dirs and demo assets
+/tmp/
+demo/demo.gif
 CLAUDE.md
