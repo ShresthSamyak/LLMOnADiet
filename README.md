@@ -1,86 +1,116 @@
-# context-engine 
-> Cut your AI coding costs by 99%. Inject only the code that matters.
+# llm-diet
 
-![demo](demo/demo.gif)
-> *Record your own: `bash demo/record_demo.sh`*
+[![PyPI version](https://img.shields.io/pypi/v/llm-diet)](https://pypi.org/project/llm-diet/)
+[![Python 3.11+](https://img.shields.io/pypi/pyversions/llm-diet)](https://pypi.org/project/llm-diet/)
+[![License: MIT](https://img.shields.io/github/license/ShresthSamyak/LLMOnADiet)](LICENSE)
+[![Downloads](https://img.shields.io/pypi/dm/llm-diet)](https://pypi.org/project/llm-diet/)
 
-## Benchmark (this repo, 185 nodes)
+**Stop sending your entire codebase to Claude. Inject only what matters.**
 
-| Query | Baseline Tokens | With CE Tokens | Reduction % | Nodes | Files Selected | Time (ms) |
-|-------|----------------|----------------|-------------|-------|----------------|----------|
-| fix authentication bug | 46,661 | 434 | 99.1% | 3 | intent.py, validator.py, patcher.py | 187 |
-| add a new API endpoint | 46,661 | 106 | 99.8% | 1 | ranker.py | 203 |
-| how does the database connection work | 46,661 | 278 | 99.4% | 2 | intent.py, retrieval.py | 219 |
-| debug memory leak | 46,661 | 428 | 99.1% | 3 | intent.py, cli.py, compressor.py | 172 |
-| add input validation | 46,661 | 0 | 100.0% | 0 | no match in this repo | 125 |
-| explain the caching logic | 46,661 | 418 | 99.1% | 3 | intent.py, pruner.py, retrieval.py | 172 |
-| fix error handling | 46,661 | 479 | 99.0% | 3 | intent.py, validator.py, patcher.py | 187 |
-| add logging to the pipeline | 46,661 | 58 | 99.9% | 1 | cli.py | 141 |
+Deterministic context retrieval for AI coding tools. Parses your repo into a call graph, scores every function against your query, and injects the top matches — before Claude starts reasoning. No embeddings, no vector DB, no LLM calls in the retrieval path.
 
-**46,661 tokens → 275 tokens average. Same accuracy. 176ms overhead (small repo).**
+## The Problem
 
-## Benchmark (external repo — fastapi, 946k token codebase)
-
-| Query | Baseline Tokens | With CE Tokens | Reduction % | Nodes | Files Selected | Time (ms) |
-|-------|----------------|----------------|-------------|-------|----------------|----------|
-| fix authentication bug | 946,210 | 87 | >99.9% | 1 | api_key.py | 359 |
-| add a new API endpoint | 946,210 | 120 | >99.9% | 1 | api_key.py | 359 |
-| how does the database connection work | 946,210 | 130 | >99.9% | 2 | tutorial001_an_py310.py, param_functions.py | 391 |
-| debug memory leak | 946,210 | 436 | >99.9% | 5 | applications.py, test_arbitrary_types.py, … | 1062 |
-| add input validation | 946,210 | 244 | >99.9% | 3 | utils.py, tutorial004_py310.py, … | 375 |
-| explain the caching logic | 946,210 | 114 | >99.9% | 1 | test_security_scopes_sub_dependency.py | 313 |
-| fix error handling | 946,210 | 221 | >99.9% | 3 | tutorial003_py310.py, tutorial002_py310.py, … | 406 |
-| add logging to the pipeline | 946,210 | 136 | >99.9% | 1 | tutorial002_an_py310.py | 328 |
-
-**946,210 tokens → 186 tokens average. Repo never seen before. 449ms overhead.**
-
-## How it works
-
+Every prompt you send carries your entire codebase as dead weight:
 ```
-User prompt → context-engine → top 5 relevant functions → Claude sees 275 tokens
-                                        ↑
-               (instead of your entire codebase at 46,661 tokens)
+Without llm-diet:  Your prompt + 946,210 tokens of codebase → Claude → answer
+With llm-diet:     Your prompt +     186 tokens of context  → Claude → same answer
 ```
 
-AST-parses your repo into a call graph. When you send a prompt, it scores every
-function by keyword relevance + call graph centrality and injects only the top
-matches — before Claude starts reasoning.
+## Benchmark
 
-No embeddings. No vector DB. No LLM calls in the retrieval path.
+**This repo (185 nodes, 46k tokens)**
 
-## Install
+| Query | Baseline | With llm-diet | Reduction | Time |
+|-------|----------|---------------|-----------|------|
+| fix authentication bug | 46,661 | 434 | 99.1% | 187ms |
+| add a new API endpoint | 46,661 | 106 | 99.8% | 203ms |
+| debug memory leak | 46,661 | 428 | 99.1% | 172ms |
+| add logging to the pipeline | 46,661 | 58 | 99.9% | 141ms |
+
+**46,661 → 275 tokens average. 176ms overhead.**
+
+**FastAPI repo (946k tokens — repo never seen before)**
+
+| Query | Baseline | With llm-diet | Reduction | Time |
+|-------|----------|---------------|-----------|------|
+| fix authentication bug | 946,210 | 87 | >99.9% | 359ms |
+| add a new API endpoint | 946,210 | 120 | >99.9% | 359ms |
+| how does the database connection work | 946,210 | 130 | >99.9% | 391ms |
+| debug memory leak | 946,210 | 436 | >99.9% | 1062ms |
+| add input validation | 946,210 | 244 | >99.9% | 375ms |
+| explain the caching logic | 946,210 | 114 | >99.9% | 313ms |
+| fix error handling | 946,210 | 221 | >99.9% | 406ms |
+| add logging to the pipeline | 946,210 | 136 | >99.9% | 328ms |
+
+**946,210 → 186 tokens average. 432ms overhead.**
+
+## How It Works
+
+```
+repo files (.py, .js, .ts, .jsx, .tsx)
+   ↓
+AST parser  (no LLM — pure tree-sitter)
+   ↓
+call graph  (.cecl/graph.json)
+   ↓
+query  →  keyword expansion  →  BFS traversal  →  top 5 functions
+   ↓
+injected into Claude before reasoning starts
+```
+Same query + same graph = same result. Deterministic by design.
+
+## Quick Start
 
 ```bash
 pip install llm-diet
-context-engine install
+context-engine install    # indexes repo + configures your AI tool
+# open Claude Code and start coding
 ```
 
-That's it. The install command indexes your repo and configures Claude Code, Cursor, or Windsurf automatically.
+## Commands
 
-## Use as CLI
+| Command | Description |
+|---------|-------------|
+| `context-engine install` | Index repo and configure Claude Code / Cursor / Windsurf |
+| `context-engine index .` | (Re)build the call graph |
+| `context-engine query "fix auth bug"` | See what would be injected for a query |
+| `context-engine apply "add endpoint"` | Plan → diff → validate → patch (needs `ANTHROPIC_API_KEY`) |
+| `context-engine watch .` | Auto-reindex on file save |
 
-```bash
-context-engine query "fix the auth bug"
-context-engine apply "add input validation to the login endpoint"
-```
+## Platform Support
 
-## Why not just use RAG / embeddings?
+| Platform | Integration | Token reduction |
+|----------|-------------|-----------------|
+| Claude Code | `UserPromptSubmit` hook — dynamic injection on every prompt | Full (186 tokens avg) |
+| Cursor | Static rules file written to `.cursor/rules/` | Guides AI; no dynamic injection |
+| Windsurf | Static rules file written to `.windsurf/rules/` | Guides AI; no dynamic injection |
 
-No LLM calls, no vector DB, no setup.
+Dynamic injection for Cursor and Windsurf is on the roadmap.
 
-context-engine uses AST parsing + call graph traversal. It's deterministic —
-same query, same graph, same result every time. Works offline. Runs in ~176ms (small repo) / ~432ms (large repo like FastAPI).
-Embeddings need a model call just to retrieve context. We don't.
+## Why Not RAG?
 
-| Feature | context-engine | code-review-graph |
-|---------|---------------|-------------------|
-| Languages | Python, JS, TS, JSX, TSX | 23 languages |
-| Dependencies | tree-sitter only | tree-sitter + SQLite + more |
-| Context injection | UserPromptSubmit hook (Claude Code) / IDE rules (Cursor, Windsurf) | MCP server |
-| Autonomous apply | ✅ plan → diff → validate → patch | ❌ |
-| Setup | pip install + index | pip install + build |
-| Incremental updates | auto on file save via `context-engine watch` | auto on file save |
+| | llm-diet | Embeddings / RAG | code-review-graph |
+|-|----------|-----------------|-------------------|
+| Retrieval method | AST + call graph | Vector similarity | AST + SQLite |
+| LLM calls to retrieve | 0 | 1+ | 0 |
+| Deterministic | Yes | No | Yes |
+| Setup | `pip install` + `index` | Model + DB infra | `pip install` + `build` |
+| Languages | Python, JS, TS, JSX, TSX | Any | 23 languages |
+| Autonomous apply | Yes | No | No |
+| Works offline | Yes | No | Yes |
 
 We do less. What we do, we do surgically.
 
-\* Full token reduction applies to Claude Code. Cursor/Windsurf receive static rules files that guide the AI to prefer provided context — dynamic injection coming in a future release.
+## Contributing
+
+Good first issues:
+- **Dynamic injection for Cursor/Windsurf** — extend beyond Claude Code's `UserPromptSubmit`
+- **More language parsers** — add Go, Rust, Java following the `FileParseResult` interface in `parser.py`
+- **Better keyword expansion** — improve domain-specific term mapping in `retrieval.py`
+
+Open an issue or send a PR.
+
+## License
+
+MIT
