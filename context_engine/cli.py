@@ -11,6 +11,7 @@ import typer
 from .apply import run_apply
 from .graph_builder import build_graph
 from .intent import format_intent_output
+from .js_parser import JS_EXTENSIONS, parse_js_file
 from .parser import parse_file
 from .retrieval import run_query
 
@@ -70,6 +71,17 @@ def _collect_py_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
+def _collect_js_files(root: Path) -> list[Path]:
+    """Walk root recursively for JS/TS files, skipping ignored directories."""
+    files: list[Path] = []
+    for ext in JS_EXTENSIONS:
+        for path in root.rglob(f"*{ext}"):
+            if any(part in IGNORE_DIRS for part in path.parts):
+                continue
+            files.append(path)
+    return sorted(set(files))
+
+
 @app.command()
 def index(
     directory: Path = typer.Argument(
@@ -82,22 +94,34 @@ def index(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
-    """Scan Python files and build a call graph saved to .cecl/graph.json."""
+    """Scan Python and JS/TS files and build a call graph saved to .cecl/graph.json."""
     _configure_logging(verbose)
     logger = logging.getLogger(__name__)
 
-    logger.info("Scanning %s for Python files…", directory)
     py_files = _collect_py_files(directory)
-    if not py_files:
-        typer.echo("No Python files found.", err=True)
+    js_files = _collect_js_files(directory)
+    all_files = py_files + js_files
+
+    if not all_files:
+        typer.echo("No Python or JS/TS files found.", err=True)
         raise typer.Exit(code=1)
 
-    logger.info("Found %d files — parsing…", len(py_files))
+    logger.info(
+        "Scanning %s — found %d Python, %d JS/TS files",
+        directory, len(py_files), len(js_files),
+    )
 
     results = []
     errors = 0
     for path in py_files:
         result = parse_file(path)
+        if result is None:
+            errors += 1
+        else:
+            results.append(result)
+
+    for path in js_files:
+        result = parse_js_file(path)
         if result is None:
             errors += 1
         else:

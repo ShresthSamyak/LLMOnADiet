@@ -65,7 +65,7 @@
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/benchmark/run_benchmark.py",
       "line": 173,
-      "code": "def main() -> None:\n    parser = argparse.ArgumentParser(description=\"Benchmark context-engine hook injection.\")\n    parser.add_argument(\"--repo\", type=Path, default=Path(\".\"), help=\"Repo to index and query (default: .)\")\n    parser.add_argument(\"--skip-index\", action=\"store_true\", help=\"Skip re-indexing (use existing .cecl/graph.json)\")\n    args = parser.parse_args()\n\n    repo = args.repo.resolve()\n    if not repo.is_dir():\n        print(f\"Error: {repo} is not a directory.\", file=sys.stderr)\n        sys.exit(1)\n\n    if not args.skip_index:\n        index_repo(repo)\n\n    print(f\"\\nCounting baseline tokens in {repo} \u2026\", flush=True)\n    baseline = baseline_tokens(repo)\n    print(f\"  Baseline: {baseline:,} tokens across all .py files\\n\")\n\n    rows: list[dict] = []\n    for query in QUERIES:\n        print(f\"  querying: {repr(query)}\", flush=True)\n        result = run_hook(query, repo)\n        result[\"query\"] = query\n        rows.append(result)\n        print(\n            f\"    \u2192 {result['nodes']} node(s), {result['tokens']} tokens, \"\n            f\"{_pct(baseline, result['tokens'])} reduction, {result['elapsed_ms']} ms\"\n        )\n\n    table = build_markdown_table(baseline, rows)\n    summary = build_summary(baseline, rows)\n\n    print(\"\\n\" + \"\u2500\" * 72)\n    print(table)\n    print(summary)\n\n    # Save to benchmark/results.md\n    out_dir = Path(__file__).parent\n    results_path = out_dir / \"results.md\"\n    results_path.write_text(\n        f\"# Context Engine Benchmark\\n\\nRepo: `{repo}`\\n\\n\"\n        + table\n        + summary,\n        encoding=\"utf-8\",\n    )\n    print(f\"Results saved to {results_path}\")"
+      "code": "def main() -> None:\n    parser = argparse.ArgumentParser(description=\"Benchmark context-engine hook injection.\")\n    parser.add_argument(\"--repo\", type=Path, default=Path(\".\"), help=\"Repo to index and query (default: .)\")\n    parser.add_argument(\"--skip-index\", action=\"store_true\", help=\"Skip re-indexing (use existing .cecl/graph.json)\")\n    args = parser.parse_args()\n\n    repo = args.repo.resolve()\n    if not repo.is_dir():\n        print(f\"Error: {repo} is not a directory.\", file=sys.stderr)\n        sys.exit(1)\n\n    if not args.skip_index:\n        index_repo(repo)\n\n    print(f\"\\nCounting baseline tokens in {repo} \u2026\", flush=True)\n    baseline = baseline_tokens(repo)\n    print(f\"  Baseline: {baseline:,} tokens across all .py files\\n\")\n\n    rows: list[dict] = []\n    for query in QUERIES:\n        print(f\"  querying: {repr(query)}\", flush=True)\n        result = run_hook(query, repo)\n        result[\"query\"] = query\n        rows.append(result)\n        print(\n            f\"    -> {result['nodes']} node(s), {result['tokens']} tokens, \"\n            f\"{_pct(baseline, result['tokens'])} reduction, {result['elapsed_ms']} ms\"\n        )\n\n    table = build_markdown_table(baseline, rows)\n    summary = build_summary(baseline, rows)\n\n    print(\"\\n\" + \"-\" * 72)\n    print(table)\n    print(summary)\n\n    # Save to benchmark/results.md\n    out_dir = Path(__file__).parent\n    results_path = out_dir / \"results.md\"\n    results_path.write_text(\n        f\"# Context Engine Benchmark\\n\\nRepo: `{repo}`\\n\\n\"\n        + table\n        + summary,\n        encoding=\"utf-8\",\n    )\n    print(f\"Results saved to {results_path}\")"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/__init__.py",
@@ -111,49 +111,56 @@
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 31,
+      "line": 32,
       "code": "def _configure_logging(verbose: bool) -> None:\n    level = logging.DEBUG if verbose else logging.INFO\n    logging.basicConfig(\n        format=\"%(levelname)s  %(message)s\",\n        level=level,\n        stream=sys.stderr,\n    )"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_print_debug",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 40,
+      "line": 41,
       "code": "def _print_debug(info: dict) -> None:\n    typer.echo(\"\u2500\u2500\u2500 DEBUG \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\", err=True)\n    gate = info.get('apply_module_gate', False)\n    fallback = info.get('gate_fallback', False)\n    gate_str = (\"yes\" if gate else \"no\") + (\" [fallback: gate bypassed \u2014 all nodes rejected]\" if fallback else \"\")\n    typer.echo(f\"Module gate applied: {gate_str}\", err=True)\n    typer.echo(\n        f\"gated-out: {info.get('module_gated_out', 0)}  \"\n        f\"passed gate: {info.get('candidates_passed_gate', 0)}  \"\n        f\"above threshold: {info.get('candidates_above_threshold', 0)}\",\n        err=True,\n    )\n    typer.echo(\"Top 5 scored candidates (before threshold):\", err=True)\n    for score, nid in info.get(\"top_candidates\", []):\n        typer.echo(f\"  {score:+4d}  {nid}\", err=True)\n    typer.echo(f\"BFS expanded: {info.get('bfs_expanded', 0)} nodes\", err=True)\n    after = info.get(\"after_pruner\", [])\n    typer.echo(f\"After pruner: {len(after)} node(s)\", err=True)\n    for nid in after:\n        typer.echo(f\"  {nid}\", err=True)\n    typer.echo(\"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\", err=True)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_py_files",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 63,
+      "line": 64,
       "code": "def _collect_py_files(root: Path) -> list[Path]:\n    \"\"\"Walk root recursively, skipping ignored directories.\"\"\"\n    files: list[Path] = []\n    for path in root.rglob(\"*.py\"):\n        if any(part in IGNORE_DIRS for part in path.parts):\n            continue\n        files.append(path)\n    return sorted(files)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_js_files",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "line": 74,
+      "code": "def _collect_js_files(root: Path) -> list[Path]:\n    \"\"\"Walk root recursively for JS/TS files, skipping ignored directories.\"\"\"\n    files: list[Path] = []\n    for ext in JS_EXTENSIONS:\n        for path in root.rglob(f\"*{ext}\"):\n            if any(part in IGNORE_DIRS for part in path.parts):\n                continue\n            files.append(path)\n    return sorted(set(files))"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 74,
-      "code": "def index(\n    directory: Path = typer.Argument(\n        default=Path(\".\"),\n        help=\"Root directory to scan (default: current directory).\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Scan Python files and build a call graph saved to .cecl/graph.json.\"\"\"\n    _configure_logging(verbose)\n    logger = logging.getLogger(__name__)\n\n    logger.info(\"Scanning %s for Python files\u2026\", directory)\n    py_files = _collect_py_files(directory)\n    if not py_files:\n        typer.echo(\"No Python files found.\", err=True)\n        raise typer.Exit(code=1)\n\n    logger.info(\"Found %d files \u2014 parsing\u2026\", len(py_files))\n\n    results = []\n    errors = 0\n    for path in py_files:\n        result = parse_file(path)\n        if result is None:\n            errors += 1\n        else:\n            results.append(result)\n\n    logger.info(\"Parsed %d files (%d skipped due to errors).\", len(results), errors)\n\n    graph = build_graph(results)\n\n    out_dir = directory / OUTPUT_DIR\n    out_dir.mkdir(parents=True, exist_ok=True)\n    out_path = out_dir / OUTPUT_FILE\n    out_path.write_text(json.dumps(graph, indent=2), encoding=\"utf-8\")\n\n    node_counts = Counter(n[\"type\"] for n in graph[\"nodes\"])\n    edge_counts = Counter(e[\"type\"] for e in graph[\"edges\"])\n    typer.echo(f\"Graph saved -> {out_path}\")\n    typer.echo(\n        f\"  nodes : {len(graph['nodes'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(node_counts.items()))\n    )\n    typer.echo(\n        f\"  edges : {len(graph['edges'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(edge_counts.items()))\n    )"
+      "line": 86,
+      "code": "def index(\n    directory: Path = typer.Argument(\n        default=Path(\".\"),\n        help=\"Root directory to scan (default: current directory).\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Scan Python and JS/TS files and build a call graph saved to .cecl/graph.json.\"\"\"\n    _configure_logging(verbose)\n    logger = logging.getLogger(__name__)\n\n    py_files = _collect_py_files(directory)\n    js_files = _collect_js_files(directory)\n    all_files = py_files + js_files\n\n    if not all_files:\n        typer.echo(\"No Python or JS/TS files found.\", err=True)\n        raise typer.Exit(code=1)\n\n    logger.info(\n        \"Scanning %s \u2014 found %d Python, %d JS/TS files\",\n        directory, len(py_files), len(js_files),\n    )\n\n    results = []\n    errors = 0\n    for path in py_files:\n        result = parse_file(path)\n        if result is None:\n            errors += 1\n        else:\n            results.append(result)\n\n    for path in js_files:\n        result = parse_js_file(path)\n        if result is None:\n            errors += 1\n        else:\n            results.append(result)\n\n    logger.info(\"Parsed %d files (%d skipped due to errors).\", len(results), errors)\n\n    graph = build_graph(results)\n\n    out_dir = directory / OUTPUT_DIR\n    out_dir.mkdir(parents=True, exist_ok=True)\n    out_path = out_dir / OUTPUT_FILE\n    out_path.write_text(json.dumps(graph, indent=2), encoding=\"utf-8\")\n\n    node_counts = Counter(n[\"type\"] for n in graph[\"nodes\"])\n    edge_counts = Counter(e[\"type\"] for e in graph[\"edges\"])\n    typer.echo(f\"Graph saved -> {out_path}\")\n    typer.echo(\n        f\"  nodes : {len(graph['nodes'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(node_counts.items()))\n    )\n    typer.echo(\n        f\"  edges : {len(graph['edges'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(edge_counts.items()))\n    )"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 129,
+      "line": 153,
       "code": "def query(\n    query_str: str = typer.Argument(..., metavar=\"QUERY\", help=\"Natural-language query, e.g. 'fix login bug'.\"),\n    graph_path: Path = typer.Option(\n        Path(\".cecl/graph.json\"),\n        \"--graph\", \"-g\",\n        help=\"Path to graph.json produced by `index`.\",\n    ),\n    raw: bool = typer.Option(False, \"--raw\", help=\"Print full JSON result instead of formatted output.\"),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n    debug: bool = typer.Option(False, \"--debug\", help=\"Print retrieval diagnostics: top candidates, BFS count, pruner output.\"),\n) -> None:\n    \"\"\"Query the code graph and return minimal relevant context.\"\"\"\n    _configure_logging(verbose)\n\n    if not graph_path.exists():\n        typer.echo(f\"Graph not found at {graph_path}. Run `context-engine index` first.\", err=True)\n        raise typer.Exit(code=1)\n\n    try:\n        graph = json.loads(graph_path.read_text(encoding=\"utf-8\"))\n    except json.JSONDecodeError as exc:\n        typer.echo(f\"Failed to parse {graph_path}: {exc}\", err=True)\n        raise typer.Exit(code=1)\n\n    debug_info: dict | None = {} if debug else None\n    result = run_query(query_str, graph, _debug=debug_info)\n\n    if debug and debug_info is not None:\n        _print_debug(debug_info)\n\n    if raw:\n        typer.echo(json.dumps(result, indent=2))\n        return\n\n    typer.echo(format_intent_output(result, graph))"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:apply",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 167,
+      "line": 191,
       "code": "def apply(\n    query_str: str = typer.Argument(..., metavar=\"QUERY\", help=\"What to add or fix, e.g. 'add login endpoint'.\"),\n    graph_path: Path = typer.Option(\n        Path(\".cecl/graph.json\"),\n        \"--graph\", \"-g\",\n        help=\"Path to graph.json produced by `index`.\",\n    ),\n    root: Path = typer.Option(\n        Path(\".\"),\n        \"--root\", \"-r\",\n        help=\"Project root directory.\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    dry_run: bool = typer.Option(False, \"--dry-run\", help=\"Show diffs without writing files.\"),\n    yes: bool = typer.Option(False, \"--yes\", \"-y\", help=\"Skip confirmation prompt.\"),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Query, plan, generate diffs, validate, and apply code changes.\"\"\"\n    _configure_logging(verbose)\n\n    if not graph_path.exists():\n        typer.echo(f\"Graph not found at {graph_path}. Run `context-engine index` first.\", err=True)\n        raise typer.Exit(code=1)\n\n    try:\n        graph = json.loads(graph_path.read_text(encoding=\"utf-8\"))\n    except json.JSONDecodeError as exc:\n        typer.echo(f\"Failed to parse {graph_path}: {exc}\", err=True)\n        raise typer.Exit(code=1)\n\n    code = run_apply(query_str, graph, root, dry_run=dry_run, yes=yes)\n    raise typer.Exit(code=code)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:main",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 204,
+      "line": 228,
       "code": "def main() -> None:\n    if hasattr(sys.stdout, \"reconfigure\"):\n        sys.stdout.reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    if hasattr(sys.stderr, \"reconfigure\"):\n        sys.stderr.reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    app()"
     },
     {
@@ -532,6 +539,80 @@
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
       "line": 1156,
       "code": "def format_intent_output(\n    result: Mapping[str, Any],\n    graph: Mapping[str, Any],\n) -> str:\n    \"\"\"Produce intent-aware CLI output for a query result.\n\n    Dispatches to one of four formatters:\n\n    * ``debug``    \u2192 CALL FLOW + POTENTIAL FAILURES + DEBUG HINTS + code\n    * ``explain``  \u2192 numbered FLOW + code\n    * ``generate`` \u2192 EXISTING COMPONENTS + SUGGESTED IMPLEMENTATION + code\n    * ``lookup``   \u2192 entry points + stats + code  (current behaviour)\n    \"\"\"\n    intent = result.get(\"intent\", \"lookup\")\n    node_map: dict[str, Any] = {n[\"id\"]: n for n in graph.get(\"nodes\", [])}\n    graph_nodes: list[Node] = list(node_map.values())\n    kept: list[Node] = [\n        node_map[nid]\n        for nid in result.get(\"nodes_selected\", [])\n        if nid in node_map\n    ]\n    edges: list[Edge] = graph.get(\"edges\", [])\n    entry_ids: list[str] = result.get(\"entry_points\", [])\n\n    flow = build_flow(kept, edges, entry_ids)\n    failures = extract_failures(kept)\n\n    if intent == \"debug\":\n        return _format_debug(result, flow, failures)\n    if intent == \"explain\":\n        return _format_explain(result, flow)\n    if intent == \"generate\":\n        return _format_generate(result, kept, graph_nodes)\n    return _format_lookup(result)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_get_parser",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 25,
+      "code": "def _get_parser(lang: str):\n    global _AVAILABLE\n    if not _AVAILABLE:\n        return None\n    if lang in _PARSERS:\n        return _PARSERS[lang]\n    try:\n        from tree_sitter_language_pack import get_parser  # type: ignore\n        p = get_parser(lang)\n        _PARSERS[lang] = p\n        return p\n    except Exception as exc:\n        logger.debug(\"tree-sitter parser unavailable for %s: %s\", lang, exc)\n        _AVAILABLE = False\n        return None"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_lang_for",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 42,
+      "code": "def _lang_for(path: Path) -> str:\n    \"\"\"Return the tree-sitter language name for a given file extension.\"\"\"\n    ext = path.suffix.lower()\n    if ext in (\".ts\", \".tsx\"):\n        return \"typescript\"\n    return \"javascript\""
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_text",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 57,
+      "code": "def _text(node) -> str:\n    \"\"\"Decode node bytes to str.\"\"\"\n    return (node.text or b\"\").decode(\"utf-8\", errors=\"replace\")"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_source_slice",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 62,
+      "code": "def _source_slice(source: str, node) -> str:\n    \"\"\"Return the exact source lines covered by *node*.\"\"\"\n    lines = source.splitlines(keepends=True)\n    start_row, _ = node.start_point\n    end_row, end_col = node.end_point\n    if start_row == end_row:\n        return lines[start_row][: end_col] if start_row < len(lines) else \"\"\n    chunk = lines[start_row: end_row + 1]\n    if chunk:\n        chunk[-1] = chunk[-1][: end_col]\n    return \"\".join(chunk)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_child_by_type",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 75,
+      "code": "def _child_by_type(node, *types: str):\n    for child in node.children:\n        if child.type in types:\n            return child\n    return None"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_named_children_by_type",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 82,
+      "code": "def _named_children_by_type(node, *types: str):\n    return [c for c in node.children if c.type in types]"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_calls",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 90,
+      "code": "def _extract_calls(node) -> list[str]:\n    \"\"\"Walk subtree and collect deduplicated callee names.\"\"\"\n    seen: dict[str, None] = {}\n\n    def walk(n):\n        if n.type == \"call_expression\":\n            fn = n.children[0] if n.children else None\n            if fn is not None:\n                if fn.type == \"identifier\":\n                    seen[_text(fn)] = None\n                elif fn.type == \"member_expression\":\n                    # foo.bar() \u2014 record \"bar\" (the method name)\n                    prop = fn.children[-1] if fn.children else None\n                    if prop and prop.type in (\"property_identifier\", \"identifier\"):\n                        seen[_text(prop)] = None\n        for child in n.children:\n            walk(child)\n\n    walk(node)\n    return list(seen)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_imports",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 116,
+      "code": "def _extract_imports(root) -> tuple[list[ImportInfo], set[str]]:\n    imports: list[ImportInfo] = []\n    imported_names: set[str] = set()\n\n    for node in root.children:\n        # ES6: import { foo, bar } from \"./module\"\n        # ES6: import DefaultExport from \"module\"\n        # ES6: import * as ns from \"module\"\n        if node.type == \"import_statement\":\n            module = \"\"\n            names: list[str] = []\n\n            # find the source string\n            for child in node.children:\n                if child.type == \"string\":\n                    module = _text(child).strip(\"'\\\"\")\n\n            clause = _child_by_type(node, \"import_clause\")\n            if clause:\n                for child in clause.children:\n                    if child.type == \"identifier\":\n                        # default import: import Foo from \"...\"\n                        names.append(_text(child))\n                        imported_names.add(_text(child))\n                    elif child.type == \"named_imports\":\n                        for spec in child.children:\n                            if spec.type == \"import_specifier\":\n                                # grab the local name (last identifier in specifier)\n                                idents = [c for c in spec.children if c.type == \"identifier\"]\n                                if idents:\n                                    local = _text(idents[-1])\n                                    names.append(local)\n                                    imported_names.add(local)\n                    elif child.type == \"namespace_import\":\n                        # import * as ns\n                        idents = [c for c in child.children if c.type == \"identifier\"]\n                        if idents:\n                            ns = _text(idents[-1])\n                            names.append(ns)\n                            imported_names.add(ns)\n\n            if module:\n                imports.append(ImportInfo(module=module, names=names))\n\n        # CommonJS: const x = require(\"module\")\n        elif node.type in (\"lexical_declaration\", \"variable_declaration\"):\n            for decl in node.children:\n                if decl.type != \"variable_declarator\":\n                    continue\n                rhs_nodes = [c for c in decl.children if c.type == \"call_expression\"]\n                for call in rhs_nodes:\n                    fn_node = call.children[0] if call.children else None\n                    if fn_node and fn_node.type == \"identifier\" and _text(fn_node) == \"require\":\n                        args = _child_by_type(call, \"arguments\")\n                        if args:\n                            strings = [c for c in args.children if c.type == \"string\"]\n                            if strings:\n                                module = _text(strings[0]).strip(\"'\\\"\")\n                                # local binding name\n                                lhs = decl.children[0] if decl.children else None\n                                name = _text(lhs) if lhs and lhs.type == \"identifier\" else \"\"\n                                imports.append(ImportInfo(module=module, names=[name] if name else []))\n                                if name:\n                                    imported_names.add(name)\n\n    return imports, imported_names"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 188,
+      "code": "def _collect_functions_and_classes(\n    root,\n    source: str,\n    file_path: str,\n) -> tuple[list[FunctionInfo], list[ClassInfo]]:\n    functions: list[FunctionInfo] = []\n    classes: list[ClassInfo] = []\n\n    def fn_name_from_node(node) -> str | None:\n        \"\"\"Return function name for any of the function node shapes.\"\"\"\n        # function_declaration / function_expression with explicit name\n        ident = _child_by_type(node, \"identifier\", \"type_identifier\")\n        if ident:\n            return _text(ident)\n        return None\n\n    def process_top_level(node):\n        t = node.type\n\n        # \u2500\u2500 named function declaration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        if t == \"function_declaration\":\n            name = fn_name_from_node(node)\n            if name:\n                functions.append(FunctionInfo(\n                    name=name,\n                    file=file_path,\n                    line=node.start_point[0] + 1,\n                    code=_source_slice(source, node),\n                    calls=_extract_calls(node),\n                ))\n\n        # \u2500\u2500 export statement \u2014 unwrap and recurse \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        elif t == \"export_statement\":\n            for child in node.children:\n                if child.type in (\n                    \"function_declaration\", \"class_declaration\",\n                    \"lexical_declaration\", \"variable_declaration\",\n                ):\n                    process_top_level(child)\n\n        # \u2500\u2500 const/let/var foo = function / arrow \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        elif t in (\"lexical_declaration\", \"variable_declaration\"):\n            for decl in node.children:\n                if decl.type != \"variable_declarator\":\n                    continue\n                lhs = decl.children[0] if decl.children else None\n                if lhs is None or lhs.type not in (\"identifier\", \"type_identifier\"):\n                    continue\n                name = _text(lhs)\n                rhs = next(\n                    (c for c in decl.children if c.type in (\"arrow_function\", \"function\")),\n                    None,\n                )\n                if rhs is not None:\n                    functions.append(FunctionInfo(\n                        name=name,\n                        file=file_path,\n                        line=decl.start_point[0] + 1,\n                        code=_source_slice(source, decl),\n                        calls=_extract_calls(rhs),\n                    ))\n\n        # \u2500\u2500 class declaration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        elif t == \"class_declaration\":\n            name_node = _child_by_type(node, \"identifier\", \"type_identifier\")\n            if name_node is None:\n                return\n            class_name = _text(name_node)\n            methods: list[MethodInfo] = []\n\n            body = _child_by_type(node, \"class_body\")\n            if body:\n                for item in body.children:\n                    if item.type != \"method_definition\":\n                        continue\n                    mname_node = _child_by_type(item, \"property_identifier\", \"identifier\")\n                    if mname_node is None:\n                        continue\n                    mname = _text(mname_node)\n                    methods.append(MethodInfo(\n                        name=mname,\n                        class_name=class_name,\n                        file=file_path,\n                        line=item.start_point[0] + 1,\n                        code=_source_slice(source, item),\n                        calls=_extract_calls(item),\n                    ))\n\n            classes.append(ClassInfo(\n                name=class_name,\n                file=file_path,\n                line=node.start_point[0] + 1,\n                methods=methods,\n            ))\n\n        # \u2500\u2500 TypeScript: interface / type alias (treated as class-like) \u2500\u2500\u2500\n        elif t == \"interface_declaration\":\n            name_node = _child_by_type(node, \"type_identifier\")\n            if name_node:\n                classes.append(ClassInfo(\n                    name=_text(name_node),\n                    file=file_path,\n                    line=node.start_point[0] + 1,\n                    methods=[],\n                ))\n\n    for child in root.children:\n        process_top_level(child)\n\n    return functions, classes"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "line": 304,
+      "code": "def parse_js_file(path: Path) -> FileParseResult | None:\n    \"\"\"Parse a single JS/TS file and return a FileParseResult, or None on error.\"\"\"\n    lang = _lang_for(path)\n    parser = _get_parser(lang)\n    if parser is None:\n        return None\n\n    rel = str(path)\n    try:\n        source = path.read_text(encoding=\"utf-8\", errors=\"replace\")\n    except OSError as exc:\n        logger.warning(\"Cannot read %s: %s\", rel, exc)\n        return None\n\n    try:\n        tree = parser.parse(source.encode(\"utf-8\", errors=\"replace\"))\n    except Exception as exc:\n        logger.warning(\"tree-sitter parse error in %s: %s\", rel, exc)\n        return None\n\n    root = tree.root_node\n    imports, imported_names = _extract_imports(root)\n    functions, classes = _collect_functions_and_classes(root, source, rel)\n\n    result = FileParseResult(\n        path=rel,\n        source=source,\n        functions=functions,\n        classes=classes,\n        imports=imports,\n        imported_names=imported_names,\n    )\n    return result"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/mcp_server.py",
@@ -1507,6 +1588,11 @@
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_js_files",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
       "type": "contains"
     },
@@ -1537,12 +1623,22 @@
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_js_files",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
       "type": "calls"
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
       "type": "calls"
     },
     {
@@ -2088,6 +2184,136 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:format_intent_output",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py:_format_generate",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_get_parser",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_lang_for",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_text",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_source_slice",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_child_by_type",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_named_children_by_type",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_calls",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_imports",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_calls",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_text",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_imports",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_child_by_type",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_imports",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:ImportInfo",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_imports",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_text",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_child_by_type",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_text",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:FunctionInfo",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_source_slice",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_calls",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:ClassInfo",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:MethodInfo",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_lang_for",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_get_parser",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_extract_imports",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:_collect_functions_and_classes",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:FileParseResult",
       "type": "calls"
     },
     {
