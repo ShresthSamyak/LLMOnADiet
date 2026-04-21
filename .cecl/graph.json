@@ -111,63 +111,70 @@
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 33,
+      "line": 34,
       "code": "def _configure_logging(verbose: bool) -> None:\n    level = logging.DEBUG if verbose else logging.INFO\n    logging.basicConfig(\n        format=\"%(levelname)s  %(message)s\",\n        level=level,\n        stream=sys.stderr,\n    )"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_print_debug",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 42,
+      "line": 43,
       "code": "def _print_debug(info: dict) -> None:\n    typer.echo(\"\u2500\u2500\u2500 DEBUG \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\", err=True)\n    gate = info.get('apply_module_gate', False)\n    fallback = info.get('gate_fallback', False)\n    gate_str = (\"yes\" if gate else \"no\") + (\" [fallback: gate bypassed \u2014 all nodes rejected]\" if fallback else \"\")\n    typer.echo(f\"Module gate applied: {gate_str}\", err=True)\n    typer.echo(\n        f\"gated-out: {info.get('module_gated_out', 0)}  \"\n        f\"passed gate: {info.get('candidates_passed_gate', 0)}  \"\n        f\"above threshold: {info.get('candidates_above_threshold', 0)}\",\n        err=True,\n    )\n    typer.echo(\"Top 5 scored candidates (before threshold):\", err=True)\n    for score, nid in info.get(\"top_candidates\", []):\n        typer.echo(f\"  {score:+4d}  {nid}\", err=True)\n    typer.echo(f\"BFS expanded: {info.get('bfs_expanded', 0)} nodes\", err=True)\n    after = info.get(\"after_pruner\", [])\n    typer.echo(f\"After pruner: {len(after)} node(s)\", err=True)\n    for nid in after:\n        typer.echo(f\"  {nid}\", err=True)\n    typer.echo(\"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\", err=True)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_py_files",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 65,
+      "line": 66,
       "code": "def _collect_py_files(root: Path) -> list[Path]:\n    \"\"\"Walk root recursively, skipping ignored directories.\"\"\"\n    files: list[Path] = []\n    for path in root.rglob(\"*.py\"):\n        if any(part in IGNORE_DIRS for part in path.parts):\n            continue\n        files.append(path)\n    return sorted(files)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_collect_js_files",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 75,
+      "line": 76,
       "code": "def _collect_js_files(root: Path) -> list[Path]:\n    \"\"\"Walk root recursively for JS/TS files, skipping ignored directories.\"\"\"\n    files: list[Path] = []\n    for ext in JS_EXTENSIONS:\n        for path in root.rglob(f\"*{ext}\"):\n            if any(part in IGNORE_DIRS for part in path.parts):\n                continue\n            files.append(path)\n    return sorted(set(files))"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:index",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 87,
+      "line": 88,
       "code": "def index(\n    directory: Path = typer.Argument(\n        default=Path(\".\"),\n        help=\"Root directory to scan (default: current directory).\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Scan Python and JS/TS files and build a call graph saved to .cecl/graph.json.\"\"\"\n    _configure_logging(verbose)\n    logger = logging.getLogger(__name__)\n\n    py_files = _collect_py_files(directory)\n    js_files = _collect_js_files(directory)\n    all_files = py_files + js_files\n\n    if not all_files:\n        typer.echo(\"No Python or JS/TS files found.\", err=True)\n        raise typer.Exit(code=1)\n\n    logger.info(\n        \"Scanning %s \u2014 found %d Python, %d JS/TS files\",\n        directory, len(py_files), len(js_files),\n    )\n\n    results = []\n    errors = 0\n    for path in py_files:\n        result = parse_file(path)\n        if result is None:\n            errors += 1\n        else:\n            results.append(result)\n\n    for path in js_files:\n        result = parse_js_file(path)\n        if result is None:\n            errors += 1\n        else:\n            results.append(result)\n\n    logger.info(\"Parsed %d files (%d skipped due to errors).\", len(results), errors)\n\n    graph = build_graph(results)\n\n    out_dir = directory / OUTPUT_DIR\n    out_dir.mkdir(parents=True, exist_ok=True)\n    out_path = out_dir / OUTPUT_FILE\n    out_path.write_text(json.dumps(graph, indent=2), encoding=\"utf-8\")\n\n    node_counts = Counter(n[\"type\"] for n in graph[\"nodes\"])\n    edge_counts = Counter(e[\"type\"] for e in graph[\"edges\"])\n    typer.echo(f\"Graph saved -> {out_path}\")\n    typer.echo(\n        f\"  nodes : {len(graph['nodes'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(node_counts.items()))\n    )\n    typer.echo(\n        f\"  edges : {len(graph['edges'])}  \"\n        + \"  \".join(f\"{t}={c}\" for t, c in sorted(edge_counts.items()))\n    )"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:query",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 154,
+      "line": 155,
       "code": "def query(\n    query_str: str = typer.Argument(..., metavar=\"QUERY\", help=\"Natural-language query, e.g. 'fix login bug'.\"),\n    graph_path: Path = typer.Option(\n        Path(\".cecl/graph.json\"),\n        \"--graph\", \"-g\",\n        help=\"Path to graph.json produced by `index`.\",\n    ),\n    raw: bool = typer.Option(False, \"--raw\", help=\"Print full JSON result instead of formatted output.\"),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n    debug: bool = typer.Option(False, \"--debug\", help=\"Print retrieval diagnostics: top candidates, BFS count, pruner output.\"),\n) -> None:\n    \"\"\"Query the code graph and return minimal relevant context.\"\"\"\n    _configure_logging(verbose)\n\n    if not graph_path.exists():\n        typer.echo(f\"Graph not found at {graph_path}. Run `context-engine index` first.\", err=True)\n        raise typer.Exit(code=1)\n\n    try:\n        graph = json.loads(graph_path.read_text(encoding=\"utf-8\"))\n    except json.JSONDecodeError as exc:\n        typer.echo(f\"Failed to parse {graph_path}: {exc}\", err=True)\n        raise typer.Exit(code=1)\n\n    debug_info: dict | None = {} if debug else None\n    result = run_query(query_str, graph, _debug=debug_info)\n\n    if debug and debug_info is not None:\n        _print_debug(debug_info)\n\n    if raw:\n        typer.echo(json.dumps(result, indent=2))\n        return\n\n    typer.echo(format_intent_output(result, graph))"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:apply",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 192,
+      "line": 193,
       "code": "def apply(\n    query_str: str = typer.Argument(..., metavar=\"QUERY\", help=\"What to add or fix, e.g. 'add login endpoint'.\"),\n    graph_path: Path = typer.Option(\n        Path(\".cecl/graph.json\"),\n        \"--graph\", \"-g\",\n        help=\"Path to graph.json produced by `index`.\",\n    ),\n    root: Path = typer.Option(\n        Path(\".\"),\n        \"--root\", \"-r\",\n        help=\"Project root directory.\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    dry_run: bool = typer.Option(False, \"--dry-run\", help=\"Show diffs without writing files.\"),\n    yes: bool = typer.Option(False, \"--yes\", \"-y\", help=\"Skip confirmation prompt.\"),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Query, plan, generate diffs, validate, and apply code changes.\"\"\"\n    _configure_logging(verbose)\n\n    if not graph_path.exists():\n        typer.echo(f\"Graph not found at {graph_path}. Run `context-engine index` first.\", err=True)\n        raise typer.Exit(code=1)\n\n    try:\n        graph = json.loads(graph_path.read_text(encoding=\"utf-8\"))\n    except json.JSONDecodeError as exc:\n        typer.echo(f\"Failed to parse {graph_path}: {exc}\", err=True)\n        raise typer.Exit(code=1)\n\n    code = run_apply(query_str, graph, root, dry_run=dry_run, yes=yes)\n    raise typer.Exit(code=code)"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:watch",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 230,
+      "line": 231,
       "code": "def watch(\n    directory: Path = typer.Argument(\n        default=Path(\".\"),\n        help=\"Root directory to watch (default: current directory).\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    verbose: bool = typer.Option(False, \"--verbose\", \"-v\", help=\"Enable debug logging.\"),\n) -> None:\n    \"\"\"Watch for file changes and auto-rebuild .cecl/graph.json.\"\"\"\n    _configure_logging(verbose)\n    _watch(directory)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:install",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "line": 248,
+      "code": "def install(\n    directory: Path = typer.Argument(\n        default=Path(\".\"),\n        help=\"Project root to set up (default: current directory).\",\n        exists=True,\n        file_okay=False,\n        dir_okay=True,\n        resolve_path=True,\n    ),\n    reindex: bool = typer.Option(\n        False, \"--reindex\", help=\"Force re-index even if graph already exists.\"\n    ),\n) -> None:\n    \"\"\"Index the repo and configure all detected AI coding tools in one step.\"\"\"\n    result = run_install(directory, force_reindex=reindex)\n    idx = result.index\n\n    typer.echo(\"\")\n\n    # --- graph line ---\n    if idx.skipped:\n        typer.echo(\n            f\"Graph already indexed ({idx.nodes} nodes) \u2014 \"\n            f\"run `context-engine index .` to refresh\"\n        )\n    else:\n        typer.echo(\n            f\"Graph:     {idx.nodes} nodes, {idx.edges} edges  \"\n            f\"({idx.py_files} Python, {idx.js_files} JS/TS files)\"\n        )\n\n    # --- platforms line ---\n    if result.platforms:\n        typer.echo(f\"Platforms: {', '.join(result.platforms)}\")\n    else:\n        typer.echo(\"\")\n        typer.echo(\n            \"No AI coding tools detected.\\n\"\n            \"Create .claude/ for Claude Code, .cursor/ for Cursor, \"\n            \"or .windsurf/ for Windsurf, then re-run.\"\n        )\n        raise typer.Exit(code=1)\n\n    typer.echo(\"Watching:  no (run `context-engine watch .` to auto-update)\")\n    typer.echo(\"\")\n    typer.echo(\"context-engine ready\")\n    typer.echo(\"\")\n    typer.echo(\"You're set. Open Claude Code and start coding.\")"
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:main",
       "type": "function",
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
-      "line": 246,
+      "line": 298,
       "code": "def main() -> None:\n    if hasattr(sys.stdout, \"reconfigure\"):\n        sys.stdout.reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    if hasattr(sys.stderr, \"reconfigure\"):\n        sys.stderr.reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    app()"
     },
     {
@@ -339,6 +346,77 @@
       "file": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py",
       "line": 128,
       "code": "def main() -> None:\n    try:\n        payload = json.loads(sys.stdin.read())\n    except Exception:\n        sys.exit(0)\n\n    query: str = payload.get(\"prompt\", \"\").strip()\n    if not query:\n        sys.exit(0)\n\n    graph = _load_graph()\n    if not graph:\n        sys.exit(0)\n\n    try:\n        result = run_query(query, graph)\n        selected: list[str] = result.get(\"nodes_selected\", [])\n        all_ids = [n[\"id\"] for n in graph.get(\"nodes\", []) if \"id\" in n]\n        pool_ids = selected if selected else all_ids\n\n        node_dicts = resolve_nodes(pool_ids, graph)\n        ranked = rank_and_select(node_dicts, query, top_n=_MAX_NODES)\n    except Exception:\n        sys.exit(0)\n\n    if not ranked:\n        sys.exit(0)\n\n    context = _build_context(ranked)\n    _log(query, len(ranked), len(context) // 4, context)\n    if context.strip():\n        sys.stdout.write(json.dumps({\"additionalContext\": context}))\n\n    sys.exit(0)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "type": "file"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_collect",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 39,
+      "code": "def _collect(root: Path) -> tuple[list[Path], list[Path]]:\n    py, js = [], []\n    for path in root.rglob(\"*\"):\n        if any(part in _IGNORE_DIRS for part in path.parts):\n            continue\n        if path.suffix == \".py\":\n            py.append(path)\n        elif path.suffix in JS_EXTENSIONS:\n            js.append(path)\n    return sorted(py), sorted(js)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_run_index",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 51,
+      "code": "def _run_index(root: Path) -> IndexResult:\n    t0 = time.monotonic()\n    py_files, js_files = _collect(root)\n\n    results = []\n    for path in py_files:\n        r = parse_file(path)\n        if r:\n            results.append(r)\n    for path in js_files:\n        r = parse_js_file(path)\n        if r:\n            results.append(r)\n\n    graph = build_graph(results)\n\n    out_dir = root / _OUTPUT_DIR\n    out_dir.mkdir(parents=True, exist_ok=True)\n    (out_dir / _OUTPUT_FILE).write_text(\n        json.dumps(graph, indent=2), encoding=\"utf-8\"\n    )\n\n    return IndexResult(\n        nodes=len(graph[\"nodes\"]),\n        edges=len(graph[\"edges\"]),\n        py_files=len(py_files),\n        js_files=len(js_files),\n        elapsed_ms=(time.monotonic() - t0) * 1000,\n        skipped=False,\n    )"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_read_existing_graph",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 83,
+      "code": "def _read_existing_graph(root: Path) -> IndexResult | None:\n    graph_path = root / _OUTPUT_DIR / _OUTPUT_FILE\n    if not graph_path.exists():\n        return None\n    try:\n        graph = json.loads(graph_path.read_text(encoding=\"utf-8\"))\n        return IndexResult(\n            nodes=len(graph[\"nodes\"]),\n            edges=len(graph[\"edges\"]),\n            py_files=0,\n            js_files=0,\n            elapsed_ms=0.0,\n            skipped=True,\n        )\n    except Exception:\n        return None"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_write_claude",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 131,
+      "code": "def _write_claude(dest: Path) -> None:\n    existing: dict = {}\n    if dest.exists():\n        try:\n            existing = json.loads(dest.read_text(encoding=\"utf-8\"))\n        except (json.JSONDecodeError, OSError):\n            pass\n\n    hook_entry = {\n        \"matcher\": \"\",\n        \"hooks\": [{\"type\": \"command\", \"command\": _HOOK_COMMAND}],\n    }\n    hooks = existing.setdefault(\"hooks\", {})\n    ups: list[dict] = hooks.setdefault(\"UserPromptSubmit\", [])\n    already = any(\n        any(h.get(\"command\") == _HOOK_COMMAND for h in e.get(\"hooks\", []))\n        for e in ups\n    )\n    if not already:\n        ups.append(hook_entry)\n\n    dest.parent.mkdir(parents=True, exist_ok=True)\n    dest.write_text(json.dumps(existing, indent=2), encoding=\"utf-8\")"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_write_rules",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 156,
+      "code": "def _write_rules(dest: Path) -> None:\n    dest.parent.mkdir(parents=True, exist_ok=True)\n    dest.write_text(_RULES_CONTENT, encoding=\"utf-8\")"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_configure_platforms",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 161,
+      "code": "def _configure_platforms(root: Path) -> list[str]:\n    \"\"\"Write configs for every detected platform. Returns list of platform names.\"\"\"\n    configured: list[str] = []\n    for p in _PLATFORMS:\n        if not (root / p.detection_dir).exists():\n            continue\n        dest = root / p.config_path\n        try:\n            if p.write_fn == \"claude\":\n                _write_claude(dest)\n            else:\n                _write_rules(dest)\n            configured.append(p.name)\n        except OSError:\n            pass\n    return configured"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:run_install",
+      "type": "function",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 189,
+      "code": "def run_install(root: Path, force_reindex: bool = False) -> InstallResult:\n    \"\"\"Index (or reuse) the graph, then configure all detected platforms.\"\"\"\n    existing = None if force_reindex else _read_existing_graph(root)\n    index_result = existing if existing else _run_index(root)\n    platforms = _configure_platforms(root)\n    return InstallResult(index=index_result, platforms=platforms)"
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:IndexResult",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 30
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:Platform",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 106
+    },
+    {
+      "id": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:InstallResult",
+      "type": "class",
+      "file": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "line": 184
     },
     {
       "id": "C:/Users/HP/Documents/llmemory tree/context_engine/intent.py",
@@ -1707,6 +1785,11 @@
     },
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:install",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:main",
       "type": "contains"
     },
@@ -1773,6 +1856,11 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:watch",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:_configure_logging",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/cli.py:install",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:run_install",
       "type": "calls"
     },
     {
@@ -2008,6 +2096,116 @@
     {
       "from": "C:/Users/HP/Documents/llmemory tree/context_engine/hooks/user_prompt_submit.py:main",
       "to": "C:/Users/HP/Documents/llmemory tree/context_engine/ranker.py:rank_and_select",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_collect",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_run_index",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_read_existing_graph",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_write_claude",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_write_rules",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_configure_platforms",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:run_install",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:IndexResult",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:Platform",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:InstallResult",
+      "type": "contains"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_run_index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_collect",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_run_index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/graph_builder.py:build_graph",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_run_index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:IndexResult",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_run_index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/parser.py:parse_file",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_run_index",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/js_parser.py:parse_js_file",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_read_existing_graph",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:IndexResult",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_configure_platforms",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_write_claude",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_configure_platforms",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_write_rules",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:run_install",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_configure_platforms",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:run_install",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:InstallResult",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:run_install",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_read_existing_graph",
+      "type": "calls"
+    },
+    {
+      "from": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:run_install",
+      "to": "C:/Users/HP/Documents/llmemory tree/context_engine/installer.py:_run_index",
       "type": "calls"
     },
     {

@@ -10,7 +10,7 @@ import typer
 
 from .apply import run_apply
 from .graph_builder import build_graph
-from .installer import install as _install
+from .installer import run_install
 from .intent import format_intent_output
 from .js_parser import JS_EXTENSIONS, parse_js_file
 from .parser import parse_file
@@ -248,27 +248,51 @@ def watch(
 def install(
     directory: Path = typer.Argument(
         default=Path("."),
-        help="Project root to configure (default: current directory).",
+        help="Project root to set up (default: current directory).",
         exists=True,
         file_okay=False,
         dir_okay=True,
         resolve_path=True,
     ),
+    reindex: bool = typer.Option(
+        False, "--reindex", help="Force re-index even if graph already exists."
+    ),
 ) -> None:
-    """Auto-detect AI coding tools and write context-engine hook configs."""
-    results = _install(directory)
+    """Index the repo and configure all detected AI coding tools in one step."""
+    result = run_install(directory, force_reindex=reindex)
+    idx = result.index
 
-    if not results:
+    typer.echo("")
+
+    # --- graph line ---
+    if idx.skipped:
         typer.echo(
-            "No supported AI coding tools detected.\n"
-            "Expected one of: .claude/  .cursor/  .windsurf/\n"
-            "Create the directory for your tool and re-run.",
-            err=True,
+            f"Graph already indexed ({idx.nodes} nodes) — "
+            f"run `context-engine index .` to refresh"
+        )
+    else:
+        typer.echo(
+            f"Graph:     {idx.nodes} nodes, {idx.edges} edges  "
+            f"({idx.py_files} Python, {idx.js_files} JS/TS files)"
+        )
+
+    # --- platforms line ---
+    if result.platforms:
+        typer.echo(f"Platforms: {', '.join(result.platforms)}")
+    else:
+        typer.echo("")
+        typer.echo(
+            "No AI coding tools detected.\n"
+            "Create .claude/ for Claude Code, .cursor/ for Cursor, "
+            "or .windsurf/ for Windsurf, then re-run."
         )
         raise typer.Exit(code=1)
 
-    for platform, config_path, status in results:
-        typer.echo(f"  {platform:<14}  {config_path}  ({status})")
+    typer.echo("Watching:  no (run `context-engine watch .` to auto-update)")
+    typer.echo("")
+    typer.echo("context-engine ready")
+    typer.echo("")
+    typer.echo("You're set. Open Claude Code and start coding.")
 
 
 def main() -> None:

@@ -1,4 +1,4 @@
-"""Auto-installer — detects installed AI coding tools and configures the hook.
+"""One-command installer — indexes the repo, configures all detected AI tools.
 
 Supported platforms
 -------------------
@@ -9,84 +9,114 @@ Windsurf     — .windsurf/rules/context-engine.md
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .graph_builder import build_graph
+from .js_parser import JS_EXTENSIONS, parse_js_file
+from .parser import parse_file
+
+_IGNORE_DIRS = frozenset({"venv", ".venv", "__pycache__", ".git", "node_modules", ".cecl"})
+_OUTPUT_DIR = ".cecl"
+_OUTPUT_FILE = "graph.json"
+
+
 # ---------------------------------------------------------------------------
-# Platform definitions
+# Index step
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IndexResult:
+    nodes: int
+    edges: int
+    py_files: int
+    js_files: int
+    elapsed_ms: float
+    skipped: bool        # True when an existing graph was reused
+
+
+def _collect(root: Path) -> tuple[list[Path], list[Path]]:
+    py, js = [], []
+    for path in root.rglob("*"):
+        if any(part in _IGNORE_DIRS for part in path.parts):
+            continue
+        if path.suffix == ".py":
+            py.append(path)
+        elif path.suffix in JS_EXTENSIONS:
+            js.append(path)
+    return sorted(py), sorted(js)
+
+
+def _run_index(root: Path) -> IndexResult:
+    t0 = time.monotonic()
+    py_files, js_files = _collect(root)
+
+    results = []
+    for path in py_files:
+        r = parse_file(path)
+        if r:
+            results.append(r)
+    for path in js_files:
+        r = parse_js_file(path)
+        if r:
+            results.append(r)
+
+    graph = build_graph(results)
+
+    out_dir = root / _OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / _OUTPUT_FILE).write_text(
+        json.dumps(graph, indent=2), encoding="utf-8"
+    )
+
+    return IndexResult(
+        nodes=len(graph["nodes"]),
+        edges=len(graph["edges"]),
+        py_files=len(py_files),
+        js_files=len(js_files),
+        elapsed_ms=(time.monotonic() - t0) * 1000,
+        skipped=False,
+    )
+
+
+def _read_existing_graph(root: Path) -> IndexResult | None:
+    graph_path = root / _OUTPUT_DIR / _OUTPUT_FILE
+    if not graph_path.exists():
+        return None
+    try:
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        return IndexResult(
+            nodes=len(graph["nodes"]),
+            edges=len(graph["edges"]),
+            py_files=0,
+            js_files=0,
+            elapsed_ms=0.0,
+            skipped=True,
+        )
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Platform configuration
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Platform:
     name: str
-    detection_dir: str          # relative to repo root — presence means installed
-    config_path: str            # file to write
-    write_fn: str               # name of the writer function below
+    detection_dir: str
+    config_path: str
+    write_fn: str
 
 
 _PLATFORMS: list[Platform] = [
-    Platform(
-        name="Claude Code",
-        detection_dir=".claude",
-        config_path=".claude/settings.json",
-        write_fn="claude",
-    ),
-    Platform(
-        name="Cursor",
-        detection_dir=".cursor",
-        config_path=".cursor/rules/context-engine.mdc",
-        write_fn="cursor",
-    ),
-    Platform(
-        name="Windsurf",
-        detection_dir=".windsurf",
-        config_path=".windsurf/rules/context-engine.md",
-        write_fn="windsurf",
-    ),
+    Platform("Claude Code", ".claude",   ".claude/settings.json",              "claude"),
+    Platform("Cursor",      ".cursor",   ".cursor/rules/context-engine.mdc",   "rules"),
+    Platform("Windsurf",    ".windsurf", ".windsurf/rules/context-engine.md",  "rules"),
 ]
 
-
-# ---------------------------------------------------------------------------
-# Per-platform writers
-# ---------------------------------------------------------------------------
-
-def _write_claude(dest: Path) -> str:
-    """Merge or create .claude/settings.json with the UserPromptSubmit hook."""
-    existing: dict = {}
-    if dest.exists():
-        try:
-            existing = json.loads(dest.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    hook_entry = {
-        "matcher": "",
-        "hooks": [
-            {
-                "type": "command",
-                "command": "python context_engine/hooks/user_prompt_submit.py",
-            }
-        ],
-    }
-
-    hooks = existing.setdefault("hooks", {})
-    ups_list: list[dict] = hooks.setdefault("UserPromptSubmit", [])
-
-    # Avoid duplicate: check if our command is already present.
-    already = any(
-        any(
-            h.get("command") == hook_entry["hooks"][0]["command"]
-            for h in entry.get("hooks", [])
-        )
-        for entry in ups_list
-    )
-    if not already:
-        ups_list.append(hook_entry)
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    return "UserPromptSubmit hook registered"
-
+_HOOK_COMMAND = "python context_engine/hooks/user_prompt_submit.py"
 
 _RULES_CONTENT = """\
 # context-engine
@@ -98,38 +128,67 @@ the codebase yourself when the provided context is sufficient.
 """
 
 
-def _write_rules(dest: Path) -> str:
+def _write_claude(dest: Path) -> None:
+    existing: dict = {}
+    if dest.exists():
+        try:
+            existing = json.loads(dest.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    hook_entry = {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": _HOOK_COMMAND}],
+    }
+    hooks = existing.setdefault("hooks", {})
+    ups: list[dict] = hooks.setdefault("UserPromptSubmit", [])
+    already = any(
+        any(h.get("command") == _HOOK_COMMAND for h in e.get("hooks", []))
+        for e in ups
+    )
+    if not already:
+        ups.append(hook_entry)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+
+
+def _write_rules(dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(_RULES_CONTENT, encoding="utf-8")
-    return f"Rules file written"
+
+
+def _configure_platforms(root: Path) -> list[str]:
+    """Write configs for every detected platform. Returns list of platform names."""
+    configured: list[str] = []
+    for p in _PLATFORMS:
+        if not (root / p.detection_dir).exists():
+            continue
+        dest = root / p.config_path
+        try:
+            if p.write_fn == "claude":
+                _write_claude(dest)
+            else:
+                _write_rules(dest)
+            configured.append(p.name)
+        except OSError:
+            pass
+    return configured
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def install(root: Path) -> list[tuple[str, str, str]]:
-    """Detect platforms under *root* and write configs.
+@dataclass
+class InstallResult:
+    index: IndexResult
+    platforms: list[str]
 
-    Returns list of (platform_name, config_path, status_message).
-    """
-    results: list[tuple[str, str, str]] = []
 
-    for platform in _PLATFORMS:
-        detection = root / platform.detection_dir
-        if not detection.exists():
-            continue
-
-        dest = root / platform.config_path
-
-        try:
-            if platform.write_fn == "claude":
-                status = _write_claude(dest)
-            else:
-                status = _write_rules(dest)
-        except OSError as exc:
-            status = f"ERROR: {exc}"
-
-        results.append((platform.name, platform.config_path, status))
-
-    return results
+def run_install(root: Path, force_reindex: bool = False) -> InstallResult:
+    """Index (or reuse) the graph, then configure all detected platforms."""
+    existing = None if force_reindex else _read_existing_graph(root)
+    index_result = existing if existing else _run_index(root)
+    platforms = _configure_platforms(root)
+    return InstallResult(index=index_result, platforms=platforms)
