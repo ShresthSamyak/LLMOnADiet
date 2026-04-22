@@ -3,7 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/llm-diet)](https://pypi.org/project/llm-diet/)
 [![Python 3.11+](https://img.shields.io/pypi/pyversions/llm-diet)](https://pypi.org/project/llm-diet/)
 [![License: MIT](https://img.shields.io/github/license/ShresthSamyak/LLM_DIET)](LICENSE)
-[![Downloads](https://img.shields.io/pypi/dm/llm-diet)](https://pypi.org/project/llm-diet/)
+[![Downloads](https://img.shields.io/badge/downloads-PyPI-brightgreen)](https://pypi.org/project/llm-diet/)
 
 **Stop sending your entire codebase to Claude. Inject only what matters.**
 
