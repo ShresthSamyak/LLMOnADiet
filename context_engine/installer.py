@@ -118,6 +118,29 @@ _PLATFORMS: list[Platform] = [
 
 _HOOK_COMMAND = "python -m context_engine.hooks.user_prompt_submit"
 
+_CLAUDE_MD_SENTINEL = "<!-- context-engine -->"
+
+_CLAUDE_MD_CONTENT = f"""\
+{_CLAUDE_MD_SENTINEL}
+# context-engine is active in this project
+
+Every prompt you send is automatically prefixed with the most relevant
+functions from this codebase via the UserPromptSubmit hook.
+
+## IMPORTANT — read this before every response:
+
+The additionalContext you receive contains the exact functions most
+relevant to the user's query, selected by AST call graph analysis.
+
+Rules:
+1. If additionalContext contains relevant functions — USE THEM DIRECTLY.
+   Do not read those files again. Do not explore the codebase first.
+2. Only read additional files if additionalContext is clearly insufficient.
+3. Say "Using injected context" at the start if you used it.
+
+This reduces token usage and gives faster, more accurate answers.
+"""
+
 _RULES_CONTENT = """\
 # context-engine
 
@@ -158,6 +181,16 @@ def _write_rules(dest: Path) -> None:
     dest.write_text(_RULES_CONTENT, encoding="utf-8")
 
 
+def _write_claude_md(root: Path) -> None:
+    """Write or append the context-engine section to CLAUDE.md."""
+    dest = root / "CLAUDE.md"
+    existing = dest.read_text(encoding="utf-8") if dest.exists() else ""
+    if _CLAUDE_MD_SENTINEL in existing:
+        return  # already present — don't duplicate
+    separator = "\n" if existing and not existing.endswith("\n\n") else ""
+    dest.write_text(existing + separator + _CLAUDE_MD_CONTENT, encoding="utf-8")
+
+
 def _configure_platforms(root: Path) -> list[str]:
     """Write configs for every detected platform. Returns list of platform names."""
     configured: list[str] = []
@@ -191,4 +224,5 @@ def run_install(root: Path, force_reindex: bool = False) -> InstallResult:
     existing = None if force_reindex else _read_existing_graph(root)
     index_result = existing if existing else _run_index(root)
     platforms = _configure_platforms(root)
+    _write_claude_md(root)
     return InstallResult(index=index_result, platforms=platforms)
