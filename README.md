@@ -1,13 +1,14 @@
 # llm-diet
 
-[![PyPI version](https://img.shields.io/pypi/v/llm-diet)](https://pypi.org/project/llm-diet/)
-[![Python 3.11+](https://img.shields.io/pypi/pyversions/llm-diet)](https://pypi.org/project/llm-diet/)
+**Give Claude the right context upfront. Fewer turns, faster answers, lower cost.**
+
+[![PyPI](https://img.shields.io/pypi/v/llm-diet)](https://pypi.org/project/llm-diet/)
 [![License: MIT](https://img.shields.io/github/license/ShresthSamyak/LLM_DIET)](LICENSE)
 [![Downloads](https://img.shields.io/badge/downloads-PyPI-brightgreen)](https://pypi.org/project/llm-diet/)
 
-**Give Claude the right context upfront. Fewer turns, faster answers, lower cost.**
+Deterministic context retrieval for AI coding tools. Parses your repo into a call graph, intercepts every file read Claude makes, and returns compressed versions — so Claude explores freely but cheaply.
 
-Deterministic context retrieval for AI coding tools. Parses your repo into a call graph, scores every function against your query, and injects the top matches — before Claude starts reasoning. No embeddings, no vector DB, no LLM calls in the retrieval path.
+---
 
 ## The Problem
 
@@ -15,145 +16,157 @@ Every Claude Code session starts blind. Claude explores your entire codebase bef
 
 ```
 Without llm-diet:
-  Your prompt → Claude explores codebase → finds relevant code → answers
+  Claude reads 10 files × 8,000 tokens = 80,000 tokens consumed
   Cost: $0.19 for a simple bug fix session
 
 With llm-diet:
-  Your prompt + injected context → Claude answers faster
-  Cost: $0.035 for the same depth of answer
+  Claude reads 10 files × 300 tokens  = 3,000 tokens consumed
+  Cost: $0.025 for the same session
 ```
 
-Real test on a 1,240-node project: 5x cheaper per session.
-
-## Benchmark
-
-**This repo (185 nodes, 46k tokens)**
-
-| Query | Baseline | With llm-diet | Reduction | Time |
-|-------|----------|---------------|-----------|------|
-| fix authentication bug | 46,661 | 434 | 99.1% | 187ms |
-| add a new API endpoint | 46,661 | 106 | 99.8% | 203ms |
-| debug memory leak | 46,661 | 428 | 99.1% | 172ms |
-| add logging to the pipeline | 46,661 | 58 | 99.9% | 141ms |
-
-**46,661 → 275 tokens average. 176ms overhead.**
-
-**FastAPI repo (946k tokens — repo never seen before)**
-
-| Query | Baseline | With llm-diet | Reduction | Time |
-|-------|----------|---------------|-----------|------|
-| fix authentication bug | 946,210 | 87 | >99.9% | 359ms |
-| add a new API endpoint | 946,210 | 120 | >99.9% | 359ms |
-| how does the database connection work | 946,210 | 130 | >99.9% | 391ms |
-| debug memory leak | 946,210 | 436 | >99.9% | 1062ms |
-| add input validation | 946,210 | 244 | >99.9% | 375ms |
-| explain the caching logic | 946,210 | 114 | >99.9% | 313ms |
-| fix error handling | 946,210 | 221 | >99.9% | 406ms |
-| add logging to the pipeline | 946,210 | 136 | >99.9% | 328ms |
-
-**946,210 → 186 tokens injected. 5x cheaper sessions in practice.**
+---
 
 ## How It Works
 
 ```
-repo files (.py, .js, .ts, .jsx, .tsx)
-   ↓
-AST parser  (no LLM — pure tree-sitter)
-   ↓
-call graph  (.cecl/graph.json)
-   ↓
-query  →  keyword expansion  →  BFS traversal  →  top 5 functions
-   ↓
-injected into Claude before reasoning starts
+User prompt
+│
+▼
+context-engine (call graph)
+│  scores every function against your query
+▼
+Claude Code session opens
+│
+▼
+Claude calls read_file("validators/amazon.py")
+│
+▼
+llm-diet-shadow MCP server intercepts
+│  returns compressed 872-token version
+│  instead of raw 6,590-token file
+▼
+Claude answers — correctly — using compressed context
 ```
-Same query + same graph = same result. Deterministic by design.
 
-## MCP Shadow Server (new in 0.1.7)
+Claude thinks it explored. It did — but every read returned our compressed version, not the raw file.
 
-By default, Claude Code explores your codebase after receiving injected context — reading files directly even when we've already told it what's relevant.
+---
 
-The shadow server fixes this at the transport layer. When `context-engine install` detects a built graph, it registers a local MCP server in `.mcp.json`. Claude Code routes all `read_file` calls through this server, which returns compressed call-graph versions instead of raw files.
+## Benchmark
 
-**Real numbers on a 40-node project (coupon-hunter-poc):**
+**Tested on coupon-hunter-poc (40-node Python project)**
 
 | File | Original | Compressed | Reduction |
 |------|----------|------------|-----------|
-| playwright_amazon.py | 6,590 chars | 872 chars | 86% |
-| orchestrator.py | 10,492 chars | 2,169 chars | 79% |
-| connectors/playwright_amazon.py | 3,067 chars | 631 chars | 79% |
+| validators/playwright_amazon.py | 6,590 chars | 872 chars | **86%** |
+| orchestrator.py | 10,492 chars | 2,169 chars | **79%** |
+| connectors/playwright_amazon.py | 3,067 chars | 631 chars | **79%** |
+| openrouter_agent.py | 2,860 chars | 966 chars | **66%** |
+| retailmenot_scraper.py | 2,705 chars | 960 chars | **64%** |
+| normalizer.py | 1,074 chars | 555 chars | **48%** |
 
-**Overall: 32,856 → 10,044 chars across all indexed files (69% reduction, ~5,700 tokens saved per full codebase read)**
+**Overall: 32,856 → 10,044 chars across all indexed files**
+**69% reduction — ~5,700 tokens saved per full codebase read**
 
-Files not in the graph pass through unchanged. Binary files are skipped. Large unindexed files (>50k chars) are truncated to 200 lines with a note to run `context-engine index`.
+**Session cost comparison (same task, same codebase):**
 
-## diet-run (new in 0.1.8)
+| Mode | Cost | Tokens |
+|------|------|--------|
+| Plain `claude` (no llm-diet) | $0.19 | ~80,000 |
+| `claude` with llm-diet | $0.035 | ~15,000 |
+| `diet-run` (enforced mode) | $0.025 | ~10,000 |
 
-`diet-run` is a CLI wrapper that launches Claude Code in fully enforced Low Bandwidth Mode:
+**FastAPI benchmark (946-node project):**
 
-```bash
-diet-run                    # run in current directory
-diet-run /path/to/project   # run in specific directory
-```
+| Query | Tokens without | Tokens injected | Reduction |
+|-------|---------------|-----------------|-----------|
+| fix error handling | 946,210 | 221 | >99.9% |
+| add logging to pipeline | 946,210 | 136 | >99.9% |
 
-What it does:
-- Sets `LLM_DIET_STRICT=1` — unindexed files return an error instead of raw content
-- Passes `--mcp-config .mcp.json` — shadow server is the only file reader
-- Passes `--disallowed-tools Read` — Claude's built-in Read tool is blocked
-- Requires `.cecl/graph.json` and `.mcp.json` to exist before launching
-
-Run `context-engine install` first to set up the shadow server, then use `diet-run` instead of `claude` to open sessions.
+---
 
 ## Quick Start
 
 ```bash
 pip install llm-diet
-context-engine install    # indexes repo + configures your AI tool
-# open Claude Code and start coding
+cd your-project
+mkdir .claude  # tells llm-diet Claude Code is present
+context-engine install
 ```
 
-## Commands
+Then open Claude Code normally:
 
-| Command | Description |
-|---------|-------------|
-| `context-engine install` | Index repo and configure Claude Code / Cursor / Windsurf |
-| `context-engine index .` | (Re)build the call graph |
-| `context-engine query "fix auth bug"` | See what would be injected for a query |
-| `context-engine apply "add endpoint"` | Plan → diff → validate → patch (needs `ANTHROPIC_API_KEY`) |
-| `context-engine watch .` | Auto-reindex on file save |
+```bash
+claude
+```
+
+Or use enforced mode (blocks built-in Read tool, strict compression):
+
+```bash
+diet-run
+```
+
+---
+
+## What context-engine install does
+
+1. Builds a call graph of your entire codebase (Python, JS, TS, JSX, TSX)
+2. Writes `.mcp.json` — registers the shadow MCP server
+3. Writes `CLAUDE.md` — tells Claude to use Low Bandwidth Mode
+
+One command. No config files to edit manually.
+
+---
+
+## The Shadow MCP Server
+
+The shadow server is the core mechanism. It registers as an MCP server in `.mcp.json`. When Claude calls `read_file`, the shadow server intercepts it and returns:
+
+- **HIT** (file is indexed): compressed call-graph version — signatures, first 8 lines of body, return/raise statements. Docstrings and comments stripped.
+- **MISS** (file not indexed): raw file contents passed through unchanged
+- **Binary files**: skipped with a one-line note
+- **Large unindexed files** (>50k chars): truncated to 200 lines with an indexing suggestion
+
+---
+
+## diet-run (enforced mode)
+
+```bash
+diet-run                    # current directory
+diet-run /path/to/project   # specific directory
+```
+
+Launches Claude Code with:
+- `LLM_DIET_STRICT=1` — unindexed files return an error instead of raw content
+- `--disallowed-tools Read,Bash,Glob,Grep` — filesystem exploration tools blocked
+- Shadow server as the only file reader
+
+Requires `.cecl/graph.json` and `.mcp.json` to exist (run `context-engine install` first).
+
+---
 
 ## Platform Support
 
-| Platform | Integration | Token reduction |
-|----------|-------------|-----------------|
-| Claude Code | `UserPromptSubmit` hook — dynamic injection on every prompt | Full (186 tokens avg) |
-| Cursor | Static rules file written to `.cursor/rules/` | Guides AI; no dynamic injection |
-| Windsurf | Static rules file written to `.windsurf/rules/` | Guides AI; no dynamic injection |
+| Platform | Status |
+|----------|--------|
+| Claude Code | ✅ Full support — shadow MCP server, diet-run, CLAUDE.md |
+| Cursor | ⚠️ Static rules file only (`.cursor/rules/`) |
+| Windsurf | ⚠️ Static rules file only (`.windsurf/rules/`) |
 
-Full token reduction verified on Claude Code. Cursor/Windsurf dynamic injection on the roadmap.
+---
 
 ## Why Not RAG?
 
-| | llm-diet | Embeddings / RAG | code-review-graph |
-|-|----------|-----------------|-------------------|
-| Retrieval method | AST + call graph | Vector similarity | AST + SQLite |
-| LLM calls to retrieve | 0 | 1+ | 0 |
-| Deterministic | Yes | No | Yes |
-| Setup | `pip install` + `index` | Model + DB infra | `pip install` + `build` |
-| Languages | Python, JS, TS, JSX, TSX | Any | 23 languages |
-| Autonomous apply | Yes | No | No |
-| Works offline | Yes | No | Yes |
+RAG requires embeddings, a vector database, and an LLM call in the retrieval path. llm-diet uses AST call graph analysis — deterministic, zero LLM calls at retrieval time, same query always returns the same result.
 
-We do less. What we do, we do surgically.
+---
 
-## Contributing
+## Commands
 
-Good first issues:
-- **Dynamic injection for Cursor/Windsurf** — extend beyond Claude Code's `UserPromptSubmit`
-- **More language parsers** — add Go, Rust, Java following the `FileParseResult` interface in `parser.py`
-- **Better keyword expansion** — improve domain-specific term mapping in `retrieval.py`
-
-Open an issue or send a PR.
-
-## License
-
-MIT
+| Command | What it does |
+|---------|-------------|
+| `context-engine install` | Index codebase, write .mcp.json and CLAUDE.md |
+| `context-engine index .` | Re-index after adding new files |
+| `context-engine watch .` | Auto-reindex on file save |
+| `diet-run` | Launch Claude Code in enforced Low Bandwidth Mode |
+| `diet-mcp` | Start the shadow MCP server manually |
