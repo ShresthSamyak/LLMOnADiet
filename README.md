@@ -68,13 +68,14 @@ Claude thinks it explored. It did — but every read returned our compressed ver
 **Overall: 32,856 → 10,044 chars across all indexed files**
 **69% reduction — ~5,700 tokens saved per full codebase read**
 
-**Session cost comparison (same task, same codebase):**
+**Session cost comparison (same task, same codebase — coupon-hunter-poc, verified live):**
 
-| Mode | Cost | Tokens |
-|------|------|--------|
-| Plain `claude` (no llm-diet) | $0.19 | ~80,000 |
-| `claude` with llm-diet | $0.035 | ~15,000 |
-| `diet-run` (enforced mode) | $0.025 | ~10,000 |
+| Task | `diet-run` | plain `claude` | Savings |
+|------|-----------|----------------|---------|
+| Read file + explain function | $0.029 | $0.033 | 12% |
+| Read file + find bug + write fix | $0.071 | $0.079 | 10% |
+
+Both sessions used the shadow MCP server for initial exploration. `diet-run` routes all file reads through compressed call-graph output — plain `claude` falls back to raw file reads when compressed output is truncated.
 
 **FastAPI benchmark (946-node project):**
 
