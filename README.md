@@ -68,6 +68,24 @@ injected into Claude before reasoning starts
 ```
 Same query + same graph = same result. Deterministic by design.
 
+## MCP Shadow Server (new in 0.1.7)
+
+By default, Claude Code explores your codebase after receiving injected context — reading files directly even when we've already told it what's relevant.
+
+The shadow server fixes this at the transport layer. When `context-engine install` detects a built graph, it registers a local MCP server in `.mcp.json`. Claude Code routes all `read_file` calls through this server, which returns compressed call-graph versions instead of raw files.
+
+**Real numbers on a 40-node project (coupon-hunter-poc):**
+
+| File | Original | Compressed | Reduction |
+|------|----------|------------|-----------|
+| playwright_amazon.py | 6,590 chars | 872 chars | 86% |
+| orchestrator.py | 10,492 chars | 2,169 chars | 79% |
+| connectors/playwright_amazon.py | 3,067 chars | 631 chars | 79% |
+
+**Overall: 32,856 → 10,044 chars across all indexed files (69% reduction, ~5,700 tokens saved per full codebase read)**
+
+Files not in the graph pass through unchanged. Binary files are skipped. Large unindexed files (>50k chars) are truncated to 200 lines with a note to run `context-engine index`.
+
 ## Quick Start
 
 ```bash
