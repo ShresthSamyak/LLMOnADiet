@@ -20,6 +20,13 @@ _graph_cache: dict | None = None
 _graph_loaded = False
 
 _MAX_BODY_LINES = 8
+_LARGE_FILE_CHARS = 50_000
+_LARGE_FILE_HEAD_LINES = 200
+
+_BINARY_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf",
+    ".zip", ".whl", ".exe", ".pyc", ".pkl", ".db", ".sqlite",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -66,28 +73,24 @@ def _compress_fn(code: str) -> str:
     if not lines:
         return code
 
-    # --- Parse for precise boundary info ---
     try:
         tree = ast.parse(dedented)
         fn = tree.body[0]
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             raise ValueError
     except Exception:
-        # Fallback: keep signature line + up to MAX_BODY body lines
         if len(lines) <= _MAX_BODY_LINES + 1:
             return dedented
         head = lines[:_MAX_BODY_LINES + 1]
         tail_count = len(lines) - len(head)
         return "\n".join(head) + f"\n    # ... ({tail_count} more lines)"
 
-    # Signature: everything up to (but not including) first body statement
     body_stmts = fn.body
-    body_start = body_stmts[0].lineno - 1  # 0-indexed line of first stmt
+    body_start = body_stmts[0].lineno - 1
 
     sig_lines = lines[:body_start]
     raw_body = lines[body_start:]
 
-    # Strip leading docstring
     first_stmt = body_stmts[0]
     if (
         isinstance(first_stmt, ast.Expr)
@@ -99,7 +102,6 @@ def _compress_fn(code: str) -> str:
         raw_body = raw_body[next_start:]
         body_stmts = body_stmts[1:]
 
-    # Strip lines that are only comments
     body = [l for l in raw_body if l.strip() and not l.lstrip().startswith("#")]
 
     if len(body) <= _MAX_BODY_LINES:
@@ -108,9 +110,8 @@ def _compress_fn(code: str) -> str:
     kept = body[:_MAX_BODY_LINES]
     remaining = body[_MAX_BODY_LINES:]
 
-    # Harvest return/raise from the truncated tail (AST-level)
     tail_extras: list[str] = []
-    body_line_offset = body_start + (len(raw_body) - len(body))  # adjust for stripped docstring
+    body_line_offset = body_start + (len(raw_body) - len(body))
     for stmt in body_stmts[1:]:
         if not isinstance(stmt, (ast.Return, ast.Raise)):
             continue
@@ -133,16 +134,27 @@ def _compress_fn(code: str) -> str:
 @mcp.tool()
 def read_file(file_path: str) -> str:
     """Return compressed call-graph context for indexed files, raw content otherwise."""
+    p = Path(file_path)
+
+    # 1. Binary files — skip immediately, no disk read needed
+    if p.suffix.lower() in _BINARY_EXTENSIONS:
+        return f"# [llm-diet] binary file skipped: {file_path}"
+
+    # 2. File not found
+    if not p.exists():
+        return f"# [llm-diet] file not found: {file_path}"
+
+    # 3. Empty file — return real content (empty string)
+    raw = p.read_text(encoding="utf-8", errors="replace")
+    if not raw:
+        return raw
+
     graph = _load_graph()
 
+    # HIT path — file is in the graph
     if graph is not None:
         nodes = _resolve(file_path, graph)
         if nodes:
-            try:
-                original_size = len(Path(file_path).read_text(encoding="utf-8"))
-            except OSError:
-                original_size = 0
-
             fn_blocks: list[str] = []
             for node in sorted(nodes, key=lambda n: n.get("line", 0)):
                 code = node.get("code", "").rstrip()
@@ -150,11 +162,14 @@ def read_file(file_path: str) -> str:
                     fn_blocks.append(_compress_fn(code))
 
             body = "\n\n".join(fn_blocks)
+            original_size = len(raw)
             compressed_size = len(body)
 
-            saved = original_size - compressed_size
-            saved_pct = int(100 * saved / original_size) if original_size else 0
+            # 4. Compressed is larger than original — return raw instead
+            if compressed_size >= original_size:
+                return raw
 
+            saved = original_size - compressed_size
             header = "\n".join([
                 "# [compressed by llm-diet]",
                 f"# file: {file_path}",
@@ -164,11 +179,18 @@ def read_file(file_path: str) -> str:
             ])
             return header + body
 
-    # Passthrough — file not in graph or graph not built
-    try:
-        return Path(file_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        return f"ERROR: {exc}"
+    # MISS path — file not in graph
+
+    # 5. Very large unindexed file — truncate to first 200 lines
+    if len(raw) > _LARGE_FILE_CHARS:
+        head = "\n".join(raw.splitlines()[:_LARGE_FILE_HEAD_LINES])
+        return (
+            head
+            + "\n# [llm-diet] truncated: file not indexed and exceeds 50k chars."
+            " Run context-engine index to include it."
+        )
+
+    return raw
 
 
 @mcp.tool()
@@ -185,5 +207,108 @@ def main() -> None:
     mcp.run(transport="stdio")
 
 
+# ---------------------------------------------------------------------------
+# Edge-case tests
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    main()
+    import tempfile, sys
+
+    _GRAPH_PATH = Path(".cecl/graph.json")
+    _graph_cache = None
+    _graph_loaded = False
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, condition: bool, detail: str = "") -> None:
+        results.append((name, condition, detail))
+        status = "PASS" if condition else "FAIL"
+        print(f"  [{status}] {name}" + (f" — {detail}" if detail else ""))
+
+    print("Running edge-case tests for read_file...\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        # 1. Binary file (no disk access needed — just extension check)
+        bin_path = tmp / "image.png"
+        bin_path.write_bytes(b"\x89PNG\r\n")
+        result = read_file(str(bin_path))
+        check(
+            "Binary file skipped",
+            result == f"# [llm-diet] binary file skipped: {bin_path}",
+            repr(result[:60]),
+        )
+
+        # 2. File not found
+        missing = tmp / "does_not_exist.py"
+        result = read_file(str(missing))
+        check(
+            "File not found",
+            result == f"# [llm-diet] file not found: {missing}",
+            repr(result[:60]),
+        )
+
+        # 3. Empty file
+        empty = tmp / "empty.py"
+        empty.write_text("", encoding="utf-8")
+        result = read_file(str(empty))
+        check(
+            "Empty file returns empty string",
+            result == "",
+            repr(result),
+        )
+
+        # 4. Compressed larger than original — should return raw
+        #    A tiny file with one trivial function: compression overhead > savings
+        tiny = tmp / "tiny.py"
+        tiny.write_text("def f():\n    return 1\n", encoding="utf-8")
+        original_text = tiny.read_text(encoding="utf-8")
+        # No graph loaded for tmp dir, so this hits MISS path.
+        # To test case 4, we need a HIT with bad compression ratio.
+        # Simulate by temporarily patching _resolve to return a node whose
+        # compressed output would be larger than the original.
+        import context_engine.shadow_server as _mod
+        _orig_resolve = _mod._resolve
+        _orig_load = _mod._load_graph
+
+        fake_code = "def f():\n    return 1\n"
+        _mod._resolve = lambda fp, g: [{"type": "function", "file": str(tiny), "line": 1, "code": fake_code}]
+        _mod._load_graph = lambda: {"nodes": [], "edges": []}
+
+        result = read_file(str(tiny))
+        # compressed body of fake_code = "def f():\n    return 1" (~21 chars)
+        # original "def f():\n    return 1\n" = 22 chars
+        # header alone is 100+ chars → compressed_size (body only) vs original
+        # Let's use a deliberately very short original that body alone exceeds
+        very_short = tmp / "vshort.py"
+        very_short.write_text("x=1\n", encoding="utf-8")
+        _mod._resolve = lambda fp, g: [{"type": "function", "file": str(very_short), "line": 1,
+                                         "code": "def f(a, b, c, d, e):\n    return a+b+c+d+e\n"}]
+        result = read_file(str(very_short))
+        check(
+            "Compressed >= original returns raw",
+            not result.startswith("# [compressed by llm-diet]"),
+            f"got {repr(result[:40])}",
+        )
+
+        _mod._resolve = _orig_resolve
+        _mod._load_graph = _orig_load
+
+        # 5. Large unindexed MISS file > 50k chars
+        large = tmp / "large.py"
+        large.write_text("x = 1\n" * 10000, encoding="utf-8")   # 60,000 chars, 10,000 lines
+        _mod._graph_cache = None
+        _mod._graph_loaded = False
+        result = read_file(str(large))
+        actual_lines = result.splitlines()
+        check(
+            "Large MISS file truncated to 200 lines + note",
+            len(actual_lines) == 201 and "truncated" in actual_lines[-1],
+            f"{len(actual_lines)} lines, last: {repr(actual_lines[-1][:60])}",
+        )
+
+    print()
+    passed = sum(1 for _, ok, _ in results if ok)
+    print(f"Results: {passed}/{len(results)} passed")
+    sys.exit(0 if passed == len(results) else 1)
