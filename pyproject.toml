@@ -20,7 +20,8 @@ dependencies = [
 [project.scripts]
 context-engine = "context_engine.cli:main"
 context-engine-mcp = "context_engine.mcp_server:mcp.run"
+diet-mcp = "llm_diet.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["context_engine*"]
+include = ["context_engine*", "llm_diet*"]

@@ -295,6 +295,13 @@ def install(
     typer.echo("You're set. Open Claude Code and start coding.")
 
 
+@app.command()
+def shadow() -> None:
+    """Run the shadow MCP server (intercepts read_file with call-graph context)."""
+    from .shadow_server import main as _shadow_main
+    _shadow_main()
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
